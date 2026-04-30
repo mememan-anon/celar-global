@@ -206,19 +206,18 @@ stepTwoForm.addEventListener("submit", async (event) => {
     return;
   }
 
-  const edgeFunctionUrl = `${window.SUPABASE_CONFIG.url}/functions/v1/enrich-waitlist-signup`;
-
-  fetch(edgeFunctionUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      apikey: window.SUPABASE_CONFIG.anonKey,
-      Authorization: `Bearer ${window.SUPABASE_CONFIG.anonKey}`
-    },
-    body: JSON.stringify({ signup_id: signupId })
-  }).catch((trackingError) => {
-    console.error("Edge tracking failed", trackingError);
-  });
+  supabaseClient.functions
+    .invoke("clever-task", {
+      body: { signup_id: signupId }
+    })
+    .then(({ error: trackingError }) => {
+      if (trackingError) {
+        console.error("Edge tracking failed", trackingError);
+      }
+    })
+    .catch((trackingError) => {
+      console.error("Edge tracking failed", trackingError);
+    });
 
   applySuccessState(isQualifiedLead);
   showStage("success");
