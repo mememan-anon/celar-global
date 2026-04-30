@@ -1,0 +1,10 @@
+{
+  "name": "celar-waitlist-site",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Static waitlist site",
+  "scripts": {
+    "dev": "npx serve .",
+    "start": "npx serve ."
+  }
+}
