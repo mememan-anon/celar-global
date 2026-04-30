@@ -169,7 +169,8 @@ stepTwoForm.addEventListener("submit", async (event) => {
   const volume = document.querySelector("#volume").value;
   const useCase = document.querySelector("#use-case").value.trim();
   const email = document.querySelector("#email").value.trim().toLowerCase();
-  const need = document.querySelector("#need").value;
+  const needSelect = document.querySelector("#need");
+  const need = needSelect.selectedOptions[0]?.textContent.trim() || needSelect.value;
   const corridor = document.querySelector("#corridor").value.trim();
   const personaOther = personaOtherInput.value.trim();
 
