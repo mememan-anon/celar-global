@@ -89,22 +89,6 @@ function getLeadScore({ persona, volume, useCase }) {
   return score;
 }
 
-function getTrackingFields() {
-  const params = new URLSearchParams(window.location.search);
-
-  return {
-    referrer: document.referrer || null,
-    page_url: window.location.href,
-    landing_path: window.location.pathname,
-    utm_source: params.get("utm_source"),
-    utm_medium: params.get("utm_medium"),
-    utm_campaign: params.get("utm_campaign"),
-    utm_term: params.get("utm_term"),
-    utm_content: params.get("utm_content"),
-    user_agent: navigator.userAgent
-  };
-}
-
 function applySuccessState(isQualifiedLead) {
   successTitle.textContent = "You're on the waitlist";
 
@@ -190,8 +174,7 @@ stepTwoForm.addEventListener("submit", async (event) => {
     market_context: corridor,
     lead_status: isQualifiedLead ? "qualified" : "new",
     lead_score: getLeadScore({ persona, volume, useCase }),
-    qualified_for_call: isQualifiedLead,
-    ...getTrackingFields()
+    qualified_for_call: isQualifiedLead
   };
 
   setFeedback();
