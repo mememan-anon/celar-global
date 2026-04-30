@@ -144,7 +144,7 @@ h2 {
 
 h1 {
   max-width: 11ch;
-  font-size: clamp(4rem, 8vw, 6.9rem);
+  font-size: clamp(3.7rem, 6.4vw, 5.6rem);
 }
 
 .hero-title {
