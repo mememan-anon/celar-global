@@ -72,9 +72,6 @@ Deno.serve(async (request) => {
   const ipAddress = pickIpAddress(request);
   const headers = pickRequestHeaders(request);
   const country = request.headers.get("x-vercel-ip-country") || request.headers.get("cf-ipcountry");
-  const region = request.headers.get("x-vercel-ip-country-region") || request.headers.get("x-country-region");
-  const city = request.headers.get("x-vercel-ip-city") || request.headers.get("x-city");
-  const timezone = request.headers.get("x-vercel-ip-timezone") || request.headers.get("x-timezone");
 
   const adminClient = createClient(supabaseUrl, supabaseServiceRoleKey, {
     auth: {
@@ -88,9 +85,6 @@ Deno.serve(async (request) => {
     .update({
       ip_address: ipAddress,
       ip_country: country,
-      ip_region: region,
-      ip_city: city,
-      ip_timezone: timezone,
       request_headers: headers,
       tracked_at: new Date().toISOString()
     })
