@@ -112,24 +112,24 @@ function applySuccessState(isQualifiedLead) {
     successPrimary.setAttribute("target", "_blank");
     successPrimary.setAttribute("rel", "noreferrer");
     successSecondary.classList.remove("hidden");
-    successSecondary.setAttribute("href", "#how-it-works");
+    successSecondary.setAttribute("href", "#use-cases");
     successSecondary.removeAttribute("target");
     successSecondary.removeAttribute("rel");
-    successSecondary.textContent = "See how it works";
+    successSecondary.textContent = "See use cases";
     return;
   }
 
   successCopy.textContent =
     "We'll be in touch as we review early users and learn where demand is strongest.";
-  successPrimary.textContent = "See how it works";
-  successPrimary.setAttribute("href", "#how-it-works");
+  successPrimary.textContent = "See use cases";
+  successPrimary.setAttribute("href", "#use-cases");
   successPrimary.removeAttribute("target");
   successPrimary.removeAttribute("rel");
   successSecondary.classList.add("hidden");
-  successSecondary.setAttribute("href", "#book-call");
+  successSecondary.setAttribute("href", "#waitlist");
   successSecondary.removeAttribute("target");
   successSecondary.removeAttribute("rel");
-  successSecondary.textContent = "Book a call";
+  successSecondary.textContent = "Join waitlist";
 }
 
 personaSelect.addEventListener("change", syncPersonaOtherField);
