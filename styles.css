@@ -290,7 +290,14 @@ h3 {
 .waitlist-card .card-copy {
   margin-top: 12px;
   font-size: 0.97rem;
-  line-height: 1.65;
+  line-height: 1.55;
+}
+
+.micro-trust {
+  margin: -2px 4px 0;
+  color: var(--ink-soft);
+  font-size: 0.84rem;
+  line-height: 1.4;
 }
 
 .form-stage {
@@ -343,7 +350,7 @@ h3 {
 
 .field input::placeholder,
 .field textarea::placeholder {
-  color: rgba(20, 33, 24, 0.46);
+  color: rgba(20, 33, 24, 0.58);
 }
 
 .field select {
@@ -385,10 +392,10 @@ h3 {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 52px;
+  min-height: 56px;
   border: 1px solid transparent;
   border-radius: 999px;
-  padding: 0 22px;
+  padding: 0 24px;
   cursor: pointer;
   transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
 }

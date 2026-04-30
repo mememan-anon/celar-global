@@ -7,6 +7,8 @@ const stages = Array.from(document.querySelectorAll(".form-stage"));
 const personaSelect = document.querySelector("#persona");
 const personaOtherField = document.querySelector("#persona-other-field");
 const personaOtherInput = document.querySelector("#persona-other");
+const emailInput = document.querySelector("#email");
+const useCaseInput = document.querySelector("#use-case");
 const feedback = document.querySelector("#form-feedback");
 const submitButton = stepTwoForm.querySelector('button[type="submit"]');
 
@@ -46,6 +48,16 @@ function showStage(targetStep) {
 
 function validateForm(form) {
   return form.reportValidity();
+}
+
+function focusElementNextFrame(element) {
+  if (!element) {
+    return;
+  }
+
+  window.requestAnimationFrame(() => {
+    element.focus();
+  });
 }
 
 function setFeedback(message = "", state = "error") {
@@ -130,11 +142,13 @@ nextStepButton.addEventListener("click", () => {
 
   setFeedback();
   showStage(2);
+  focusElementNextFrame(useCaseInput);
 });
 
 backStepButton.addEventListener("click", () => {
   setFeedback();
   showStage(1);
+  focusElementNextFrame(emailInput);
 });
 
 stepTwoForm.addEventListener("submit", async (event) => {
@@ -149,6 +163,7 @@ stepTwoForm.addEventListener("submit", async (event) => {
     return;
   }
 
+  const signupId = window.crypto.randomUUID();
   const persona = personaSelect.value;
   const volume = document.querySelector("#volume").value;
   const useCase = document.querySelector("#use-case").value.trim();
@@ -165,6 +180,7 @@ stepTwoForm.addEventListener("submit", async (event) => {
     volume === "100k+";
 
   const payload = {
+    id: signupId,
     email,
     persona,
     persona_other: personaOther || null,
@@ -189,6 +205,20 @@ stepTwoForm.addEventListener("submit", async (event) => {
     setFeedback("We couldn't save your signup right now. Please try again.");
     return;
   }
+
+  const edgeFunctionUrl = `${window.SUPABASE_CONFIG.url}/functions/v1/enrich-waitlist-signup`;
+
+  fetch(edgeFunctionUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: window.SUPABASE_CONFIG.anonKey,
+      Authorization: `Bearer ${window.SUPABASE_CONFIG.anonKey}`
+    },
+    body: JSON.stringify({ signup_id: signupId })
+  }).catch((trackingError) => {
+    console.error("Edge tracking failed", trackingError);
+  });
 
   applySuccessState(isQualifiedLead);
   showStage("success");
