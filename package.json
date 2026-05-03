@@ -5,6 +5,12 @@
   "description": "Static waitlist site",
   "scripts": {
     "dev": "npx serve .",
-    "start": "npx serve ."
+    "fetch:ignite": "node ./scripts/fetch-ignite-leaderboard.mjs",
+    "fetch:ignite:full": "node ./scripts/fetch-ignite-leaderboard-full.mjs",
+    "start": "npx serve .",
+    "mojo": "node ./scripts/runner.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.59.1"
   }
 }
