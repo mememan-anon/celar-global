@@ -17,11 +17,11 @@ const SONJJ_BASE_URL = 'https://app.sonjj.com';
 const DEFAULT_PROJECT_ID = '28';
 const DEFAULT_PROJECT_IGNITES = 10; //dont touch
 const DEFAULT_EMAIL_LIMIT =  500;
-const DEFAULT_BATCH_DELAY_MIN_MS = 60000;
-const DEFAULT_BATCH_DELAY_MAX_MS = 300000;
+const DEFAULT_BATCH_DELAY_MIN_MS = 5000;   // 5 seconds
+const DEFAULT_BATCH_DELAY_MAX_MS = 30000;  // 30 seconds
 const DEFAULT_OTP_WAIT_MS = 10000;
-const DEFAULT_OTP_POLL_ATTEMPTS = 3;
-const DEFAULT_NETWORK_RETRY_ATTEMPTS = 3;
+const DEFAULT_OTP_POLL_ATTEMPTS = 2;
+const DEFAULT_NETWORK_RETRY_ATTEMPTS = 2;
 const DEFAULT_NETWORK_RETRY_DELAY_MS = 1500;
 const EXPECTED_OTP_SENDERS = ['no-reply@privy.io', 'no-reply@mail.privy.io'];
 const EXPECTED_OTP_SUBJECT = 'Your login code for Surge';
@@ -393,13 +393,14 @@ async function readJsonFileWithDefault(filePath, fallbackValue) {
   return parseJsonTextWithContext(raw, filePath);
 }
 
-async function loadStringArrayFile(filePath, label) {
+async function loadStringArrayFile(filePath, label, { keepEmpty = false } = {}) {
   const payload = await readJsonFileWithDefault(filePath, []);
   if (!Array.isArray(payload)) {
     throw new Error(`${label} file must contain a top-level JSON array of strings: ${filePath}`);
   }
 
-  return payload.map((value) => String(value ?? '').trim()).filter(Boolean);
+  const normalizedValues = payload.map((value) => String(value ?? '').trim());
+  return keepEmpty ? normalizedValues : normalizedValues.filter(Boolean);
 }
 
 function validateEmailPoolEntry(entry, index, filePath, label) {
@@ -464,6 +465,110 @@ function pickFirstUnusedValue(values, usedValues, label) {
   return match;
 }
 
+function listUnusedValues(values, reservedValues) {
+  const reservedSet = new Set(
+    reservedValues.map((value) => String(value ?? '').trim()).filter(Boolean),
+  );
+
+  return values.filter((value) => !reservedSet.has(String(value ?? '').trim()));
+}
+
+function createNameAllocator(values, reservedValues) {
+  const normalizedValues = values.map((value) => String(value ?? '').trim());
+  const reservedSet = new Set(
+    reservedValues.map((value) => String(value ?? '').trim()).filter(Boolean),
+  );
+  const blankTotal = normalizedValues.filter((value) => !value).length;
+  const blankConsumedFromHistory = reservedValues
+    .map((value) => String(value ?? '').trim())
+    .filter((value) => !value).length;
+  let blankConsumed = Math.min(blankTotal, blankConsumedFromHistory);
+  let cursor = 0;
+
+  const nonEmptyAvailableCount = normalizedValues.filter(
+    (value) => value && !reservedSet.has(value),
+  ).length;
+  const blankAvailableCount = Math.max(0, blankTotal - blankConsumed);
+
+  return {
+    availableCount: nonEmptyAvailableCount + blankAvailableCount,
+
+    pickNext() {
+      for (; cursor < normalizedValues.length; cursor += 1) {
+        const candidate = normalizedValues[cursor];
+
+        if (!candidate) {
+          if (blankConsumed < blankTotal) {
+            blankConsumed += 1;
+            cursor += 1;
+            return '';
+          }
+
+          continue;
+        }
+
+        if (reservedSet.has(candidate)) {
+          continue;
+        }
+
+        reservedSet.add(candidate);
+        cursor += 1;
+        return candidate;
+      }
+
+      throw new Error('No unused name values remain in the identity pool.');
+    },
+  };
+}
+
+function createDescriptionAllocator(values, reservedValues) {
+  const normalizedValues = values.map((value) => String(value ?? '').trim());
+  const reservedSet = new Set(
+    reservedValues.map((value) => String(value ?? '').trim()).filter(Boolean),
+  );
+  const blankTotal = normalizedValues.filter((value) => !value).length;
+  const blankConsumedFromHistory = reservedValues
+    .map((value) => String(value ?? '').trim())
+    .filter((value) => !value).length;
+  let blankConsumed = Math.min(blankTotal, blankConsumedFromHistory);
+  let cursor = 0;
+
+  const nonEmptyAvailableCount = normalizedValues.filter(
+    (value) => value && !reservedSet.has(value),
+  ).length;
+  const blankAvailableCount = Math.max(0, blankTotal - blankConsumed);
+
+  return {
+    availableCount: nonEmptyAvailableCount + blankAvailableCount,
+
+    pickNext() {
+      for (; cursor < normalizedValues.length; cursor += 1) {
+        const candidate = normalizedValues[cursor];
+
+        if (!candidate) {
+          if (blankConsumed < blankTotal) {
+            blankConsumed += 1;
+            cursor += 1;
+            return '';
+          }
+
+          continue;
+        }
+
+        if (reservedSet.has(candidate)) {
+          continue;
+        }
+
+        reservedSet.add(candidate);
+        cursor += 1;
+        return candidate;
+      }
+
+      throw new Error('No unused description values remain in the identity pool.');
+    },
+  };
+}
+
 async function resolveIdentitySelections({ requestedNickname, requestedDescription, limit }) {
   const requestedLimit = Number(limit);
   if (!Number.isInteger(requestedLimit) || requestedLimit < 1) {
@@ -480,8 +585,10 @@ async function resolveIdentitySelections({ requestedNickname, requestedDescripti
     throw new Error(`Refused identities file must contain a JSON array: ${REFUSED_IDENTITIES_PATH}`);
   }
 
-  const names = await loadStringArrayFile(NAMES_POOL_PATH, 'Names pool');
-  const descriptions = await loadStringArrayFile(DESCRIPTIONS_POOL_PATH, 'Descriptions pool');
+  const names = await loadStringArrayFile(NAMES_POOL_PATH, 'Names pool', { keepEmpty: true });
+  const descriptions = await loadStringArrayFile(DESCRIPTIONS_POOL_PATH, 'Descriptions pool', {
+    keepEmpty: true,
+  });
   const emailEntries = await loadEmailEntryPoolFile(MY_EMAIL_POOL_PATH, 'My email pool');
   const blockedEmailSet = new Set(
     [...usedIdentities, ...refusedIdentities].map((entry) => normalizeEmail(entry?.email)).filter(Boolean),
@@ -495,10 +602,39 @@ async function resolveIdentitySelections({ requestedNickname, requestedDescripti
   const selectedEmailEntries = availableEmailEntries.slice(0, requestedLimit);
   const explicitNickname = String(requestedNickname ?? '').trim();
   const explicitDescription = String(requestedDescription ?? '').trim();
-  const reservedNicknames = usedIdentities.map((entry) => entry?.nickname);
-  const reservedDescriptions = usedIdentities.map((entry) => entry?.description);
+  const reservedNicknames = [...usedIdentities, ...refusedIdentities].map((entry) => entry?.nickname);
+  const reservedDescriptions = [...usedIdentities, ...refusedIdentities].map((entry) => entry?.description);
+  const nicknameAllocator = explicitNickname ? null : createNameAllocator(names, reservedNicknames);
+  const descriptionAllocator = explicitDescription
+    ? null
+    : createDescriptionAllocator(descriptions, reservedDescriptions);
+  const maxSelectable = Math.min(
+    availableEmailEntries.length,
+    explicitNickname ? Number.POSITIVE_INFINITY : nicknameAllocator.availableCount,
+    explicitDescription ? Number.POSITIVE_INFINITY : descriptionAllocator.availableCount,
+  );
 
-  return selectedEmailEntries.map((selectedEmailEntry) => {
+  if (maxSelectable < 1) {
+    if (!explicitDescription && descriptionAllocator.availableCount === 0) {
+      throw new Error('No unused description values remain in the identity pool.');
+    }
+
+    if (!explicitNickname && nicknameAllocator.availableCount === 0) {
+      throw new Error('No unused name values remain in the identity pool.');
+    }
+
+    throw new Error(`No unused email entries remain in ${MY_EMAIL_POOL_PATH}`);
+  }
+
+  const selectedCount = Math.min(requestedLimit, maxSelectable);
+  if (selectedCount < requestedLimit) {
+    console.warn(
+      `Requested limit ${requestedLimit} exceeds remaining identity capacity ${selectedCount}. ` +
+        `Continuing with ${selectedCount} email(s).`,
+    );
+  }
+
+  return availableEmailEntries.slice(0, selectedCount).map((selectedEmailEntry) => {
     const resolvedEmail = selectedEmailEntry.email;
     const existingIdentity = usedIdentities.find(
       (entry) => normalizeEmail(entry?.email) === normalizeEmail(resolvedEmail),
@@ -507,16 +643,12 @@ async function resolveIdentitySelections({ requestedNickname, requestedDescripti
     const resolvedNickname =
       explicitNickname ||
       String(existingIdentity?.nickname ?? '').trim() ||
-      pickFirstUnusedValue(names, reservedNicknames, 'name');
+      nicknameAllocator.pickNext();
 
     const resolvedDescription =
       explicitDescription ||
       String(existingIdentity?.description ?? '').trim() ||
-      pickFirstUnusedValue(
-        descriptions,
-        reservedDescriptions,
-        'description',
-      );
+      descriptionAllocator.pickNext();
 
     if (!explicitNickname) {
       reservedNicknames.push(resolvedNickname);
