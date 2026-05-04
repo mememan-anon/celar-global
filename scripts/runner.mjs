@@ -17,12 +17,8 @@ const SONJJ_BASE_URL = 'https://app.sonjj.com';
 const DEFAULT_PROJECT_ID = '28';
 const DEFAULT_PROJECT_IGNITES = 10; //dont touch at all
 const DEFAULT_EMAIL_LIMIT =  2100;
-const DEFAULT_WAVE_CONCURRENCY_MIN = 1;
-const DEFAULT_WAVE_CONCURRENCY_MAX = 5;
-const DEFAULT_BATCH_DELAY_MIN_MS = 30000;   // 30 seconds
+const DEFAULT_BATCH_DELAY_MIN_MS = 5000;   // 5 seconds
 const DEFAULT_BATCH_DELAY_MAX_MS = 90000;  // 90 seconds
-const DEFAULT_PRE_OTP_JITTER_MIN_MS = 5000;   // 5 seconds
-const DEFAULT_PRE_OTP_JITTER_MAX_MS = 20000;  // 20 seconds
 const DEFAULT_OTP_WAIT_MS = 10000;
 const DEFAULT_OTP_POLL_ATTEMPTS = 2;
 const DEFAULT_NETWORK_RETRY_ATTEMPTS = 2;
@@ -1366,48 +1362,6 @@ function createBatchFailureResult(batchIndex, email, error) {
   };
 }
 
-async function runBatchWave({
-  identitySelections,
-  startIndex,
-  waveConcurrency,
-  batchTotal,
-  inviteCode,
-  resolvedProjectId,
-  allocationAmount,
-  captchaToken,
-  otpWaitMs,
-  otpPollAttempts,
-  sonjjApiKey,
-}) {
-  const waveEntries = identitySelections.slice(startIndex, startIndex + waveConcurrency);
-
-  return Promise.all(
-    waveEntries.map(async (identitySelection, waveOffset) => {
-      const batchIndex = startIndex + waveOffset;
-
-      try {
-        const result = await runSingleLoginSession({
-          inviteCode,
-          resolvedProjectId,
-          allocationAmount,
-          captchaToken,
-          otpWaitMs,
-          otpPollAttempts,
-          sonjjApiKey,
-          identitySelection,
-          batchIndex,
-          batchTotal,
-        });
-
-        return createBatchSuccessResult(batchIndex, identitySelection.email, result.allocationStatus);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return createBatchFailureResult(batchIndex, identitySelection.email, message);
-      }
-    }),
-  );
-}
-
 function loadRuntimeConfig(args, envFile) {
   const inviteCode = readSetting(args, envFile, 'invite', 'SURGE_INVITE_CODE', '');
   const requestedNickname = readSetting(args, envFile, 'nickname', 'SURGE_PROFILE_NICKNAME', '');
@@ -1513,47 +1467,38 @@ async function main() {
   });
   const batchResults = [];
   const batchTotal = identitySelections.length;
-  let nextStartIndex = 0;
+  for (let batchIndex = 0; batchIndex < batchTotal; batchIndex += 1) {
+    const identitySelection = identitySelections[batchIndex];
 
-  while (nextStartIndex < batchTotal) {
-    const remainingCount = batchTotal - nextStartIndex;
-    const waveConcurrency = Math.min(
-      randomIntegerBetween(DEFAULT_WAVE_CONCURRENCY_MIN, DEFAULT_WAVE_CONCURRENCY_MAX),
-      remainingCount,
-    );
+    try {
+      const result = await runSingleLoginSession({
+        inviteCode,
+        resolvedProjectId,
+        allocationAmount,
+        captchaToken,
+        otpWaitMs,
+        otpPollAttempts,
+        sonjjApiKey,
+        identitySelection,
+        batchIndex,
+        batchTotal,
+      });
 
-    console.log(
-      `Starting wave at item ${nextStartIndex + 1}/${batchTotal}. ` +
-        `Running ${waveConcurrency} identities at the same time in this wave.`,
-    );
+      batchResults.push(
+        createBatchSuccessResult(batchIndex, identitySelection.email, result.allocationStatus),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      batchResults.push(createBatchFailureResult(batchIndex, identitySelection.email, message));
 
-    const waveResults = await runBatchWave({
-      identitySelections,
-      startIndex: nextStartIndex,
-      waveConcurrency,
-      batchTotal,
-      inviteCode,
-      resolvedProjectId,
-      allocationAmount,
-      captchaToken,
-      otpWaitMs,
-      otpPollAttempts,
-      sonjjApiKey,
-    });
-
-    batchResults.push(...waveResults);
-
-    for (const result of waveResults) {
-      if (!result.ok && result.error !== 'otp-refused') {
-        console.error(`[${result.batchIndex}/${batchTotal}] ${result.error}`);
+      if (message !== 'otp-refused') {
+        console.error(`[${batchIndex + 1}/${batchTotal}] ${message}`);
       }
     }
 
-    nextStartIndex += waveConcurrency;
-
-    if (nextStartIndex < batchTotal) {
+    if (batchIndex < batchTotal - 1) {
       const interEmailDelayMs = randomIntegerBetween(batchDelayMinMs, batchDelayMaxMs);
-      console.log(`Wave completed. Waiting ${interEmailDelayMs}ms before starting next wave ...`);
+      console.log(`Waiting ${interEmailDelayMs}ms before starting next email ...`);
       await sleep(interEmailDelayMs);
     }
   }
