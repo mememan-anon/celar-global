@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,7 +20,7 @@ const DEFAULT_EMAIL_LIMIT =  2100;
 const DEFAULT_BATCH_DELAY_MIN_MS = 5000;   // 5 seconds
 const DEFAULT_BATCH_DELAY_MAX_MS = 30000;  // 30 seconds
 const DEFAULT_OTP_WAIT_MS = 10000;
-const DEFAULT_OTP_POLL_ATTEMPTS = 2;
+const DEFAULT_OTP_POLL_ATTEMPTS = 3;
 const DEFAULT_NETWORK_RETRY_ATTEMPTS = 2;
 const DEFAULT_NETWORK_RETRY_DELAY_MS = 1500;
 const EXPECTED_OTP_SENDERS = ['no-reply@privy.io', 'no-reply@mail.privy.io'];
@@ -43,6 +43,10 @@ const DESCRIPTIONS_POOL_PATH = path.join(IDENTITY_POOL_DIR, 'descriptions.json')
 const MY_EMAIL_POOL_PATH = path.join(IDENTITY_POOL_DIR, 'my-email.json');
 const USED_IDENTITIES_PATH = path.join(IDENTITY_POOL_DIR, 'used-identities.json');
 const REFUSED_IDENTITIES_PATH = path.join(IDENTITY_POOL_DIR, 'refused-identities.json');
+const RESERVED_IDENTITIES_PATH = path.join(IDENTITY_POOL_DIR, 'reserved-identities.json');
+const IDENTITY_POOL_LOCK_PATH = path.join(IDENTITY_POOL_DIR, '.identity-pool.lock');
+const DEFAULT_IDENTITY_POOL_LOCK_TIMEOUT_MS = 120000;
+const IDENTITY_POOL_LOCK_RETRY_MS = 250;
 const MESSAGE_ARRAY_HINT_KEYS = ['data', 'messages', 'items', 'results', 'value'];
 let identityPoolWriteQueue = Promise.resolve();
 
@@ -404,6 +408,58 @@ async function loadStringArrayFile(filePath, label, { keepEmpty = false } = {}) 
   return keepEmpty ? normalizedValues : normalizedValues.filter(Boolean);
 }
 
+async function readIdentityRecordFile(filePath, label) {
+  const payload = await readJsonFileWithDefault(filePath, []);
+  if (!Array.isArray(payload)) {
+    throw new Error(`${label} file must contain a JSON array: ${filePath}`);
+  }
+
+  return payload;
+}
+
+async function writeJsonFile(filePath, payload) {
+  await ensureDirectory(path.dirname(filePath));
+  await writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+}
+
+async function acquireIdentityPoolLock() {
+  const startedAt = Date.now();
+
+  while (true) {
+    try {
+      await mkdir(IDENTITY_POOL_LOCK_PATH);
+      return;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') {
+        throw error;
+      }
+
+      if (Date.now() - startedAt >= DEFAULT_IDENTITY_POOL_LOCK_TIMEOUT_MS) {
+        throw new Error(
+          `Timed out waiting for identity pool lock after ${DEFAULT_IDENTITY_POOL_LOCK_TIMEOUT_MS}ms.`,
+        );
+      }
+
+      await sleep(IDENTITY_POOL_LOCK_RETRY_MS);
+    }
+  }
+}
+
+async function releaseIdentityPoolLock() {
+  await rm(IDENTITY_POOL_LOCK_PATH, { recursive: true, force: true });
+}
+
+async function withIdentityPoolLock(task) {
+  await ensureDirectory(IDENTITY_POOL_DIR);
+  await acquireIdentityPoolLock();
+
+  try {
+    return await task();
+  } finally {
+    await releaseIdentityPoolLock();
+  }
+}
+
 function validateEmailPoolEntry(entry, index, filePath, label) {
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
     throw new Error(`${label} entry at index ${index} must be an object with email and timestamp in ${filePath}`);
@@ -474,7 +530,7 @@ function listUnusedValues(values, reservedValues) {
   return values.filter((value) => !reservedSet.has(String(value ?? '').trim()));
 }
 
-function createNameAllocator(values, reservedValues) {
+function createNameAllocator(values, reservedValues, { reverse = false } = {}) {
   const normalizedValues = values.map((value) => String(value ?? '').trim());
   const reservedSet = new Set(
     reservedValues.map((value) => String(value ?? '').trim()).filter(Boolean),
@@ -484,7 +540,7 @@ function createNameAllocator(values, reservedValues) {
     .map((value) => String(value ?? '').trim())
     .filter((value) => !value).length;
   let blankConsumed = Math.min(blankTotal, blankConsumedFromHistory);
-  let cursor = 0;
+  let cursor = reverse ? normalizedValues.length - 1 : 0;
 
   const nonEmptyAvailableCount = normalizedValues.filter(
     (value) => value && !reservedSet.has(value),
@@ -495,13 +551,13 @@ function createNameAllocator(values, reservedValues) {
     availableCount: nonEmptyAvailableCount + blankAvailableCount,
 
     pickNext() {
-      for (; cursor < normalizedValues.length; cursor += 1) {
+      while (cursor >= 0 && cursor < normalizedValues.length) {
         const candidate = normalizedValues[cursor];
+        cursor += reverse ? -1 : 1;
 
         if (!candidate) {
           if (blankConsumed < blankTotal) {
             blankConsumed += 1;
-            cursor += 1;
             return '';
           }
 
@@ -513,7 +569,6 @@ function createNameAllocator(values, reservedValues) {
         }
 
         reservedSet.add(candidate);
-        cursor += 1;
         return candidate;
       }
 
@@ -522,7 +577,7 @@ function createNameAllocator(values, reservedValues) {
   };
 }
 
-function createDescriptionAllocator(values, reservedValues) {
+function createDescriptionAllocator(values, reservedValues, { reverse = false } = {}) {
   const normalizedValues = values.map((value) => String(value ?? '').trim());
   const reservedSet = new Set(
     reservedValues.map((value) => String(value ?? '').trim()).filter(Boolean),
@@ -532,7 +587,7 @@ function createDescriptionAllocator(values, reservedValues) {
     .map((value) => String(value ?? '').trim())
     .filter((value) => !value).length;
   let blankConsumed = Math.min(blankTotal, blankConsumedFromHistory);
-  let cursor = 0;
+  let cursor = reverse ? normalizedValues.length - 1 : 0;
 
   const nonEmptyAvailableCount = normalizedValues.filter(
     (value) => value && !reservedSet.has(value),
@@ -543,13 +598,13 @@ function createDescriptionAllocator(values, reservedValues) {
     availableCount: nonEmptyAvailableCount + blankAvailableCount,
 
     pickNext() {
-      for (; cursor < normalizedValues.length; cursor += 1) {
+      while (cursor >= 0 && cursor < normalizedValues.length) {
         const candidate = normalizedValues[cursor];
+        cursor += reverse ? -1 : 1;
 
         if (!candidate) {
           if (blankConsumed < blankTotal) {
             blankConsumed += 1;
-            cursor += 1;
             return '';
           }
 
@@ -561,7 +616,6 @@ function createDescriptionAllocator(values, reservedValues) {
         }
 
         reservedSet.add(candidate);
-        cursor += 1;
         return candidate;
       }
 
@@ -570,101 +624,125 @@ function createDescriptionAllocator(values, reservedValues) {
   };
 }
 
-async function resolveIdentitySelections({ requestedNickname, requestedDescription, limit }) {
-  const requestedLimit = Number(limit);
-  if (!Number.isInteger(requestedLimit) || requestedLimit < 1) {
-    throw new Error(`Limit must be a positive integer. Received: ${limit}`);
-  }
-
-  const usedIdentities = await readJsonFileWithDefault(USED_IDENTITIES_PATH, []);
-  if (!Array.isArray(usedIdentities)) {
-    throw new Error(`Used identities file must contain a JSON array: ${USED_IDENTITIES_PATH}`);
-  }
-
-  const refusedIdentities = await readJsonFileWithDefault(REFUSED_IDENTITIES_PATH, []);
-  if (!Array.isArray(refusedIdentities)) {
-    throw new Error(`Refused identities file must contain a JSON array: ${REFUSED_IDENTITIES_PATH}`);
-  }
-
-  const names = await loadStringArrayFile(NAMES_POOL_PATH, 'Names pool', { keepEmpty: true });
-  const descriptions = await loadStringArrayFile(DESCRIPTIONS_POOL_PATH, 'Descriptions pool', {
-    keepEmpty: true,
-  });
-  const emailEntries = await loadEmailEntryPoolFile(MY_EMAIL_POOL_PATH, 'My email pool');
-  const blockedEmailSet = new Set(
-    [...usedIdentities, ...refusedIdentities].map((entry) => normalizeEmail(entry?.email)).filter(Boolean),
-  );
-  const availableEmailEntries = emailEntries.filter((entry) => !blockedEmailSet.has(normalizeEmail(entry.email)));
-
-  if (availableEmailEntries.length === 0) {
-    throw new Error(`No unused email entries remain in ${MY_EMAIL_POOL_PATH}`);
-  }
-
-  const selectedEmailEntries = availableEmailEntries.slice(0, requestedLimit);
-  const explicitNickname = String(requestedNickname ?? '').trim();
-  const explicitDescription = String(requestedDescription ?? '').trim();
-  const reservedNicknames = [...usedIdentities, ...refusedIdentities].map((entry) => entry?.nickname);
-  const reservedDescriptions = [...usedIdentities, ...refusedIdentities].map((entry) => entry?.description);
-  const nicknameAllocator = explicitNickname ? null : createNameAllocator(names, reservedNicknames);
-  const descriptionAllocator = explicitDescription
-    ? null
-    : createDescriptionAllocator(descriptions, reservedDescriptions);
-  const maxSelectable = Math.min(
-    availableEmailEntries.length,
-    explicitNickname ? Number.POSITIVE_INFINITY : nicknameAllocator.availableCount,
-    explicitDescription ? Number.POSITIVE_INFINITY : descriptionAllocator.availableCount,
-  );
-
-  if (maxSelectable < 1) {
-    if (!explicitDescription && descriptionAllocator.availableCount === 0) {
-      throw new Error('No unused description values remain in the identity pool.');
+async function resolveIdentitySelections({
+  requestedNickname,
+  requestedDescription,
+  limit,
+  emailPoolPath = MY_EMAIL_POOL_PATH,
+  identityOrder = 'forward',
+}) {
+  return withIdentityPoolLock(async () => {
+    const requestedLimit = Number(limit);
+    if (!Number.isInteger(requestedLimit) || requestedLimit < 1) {
+      throw new Error(`Limit must be a positive integer. Received: ${limit}`);
     }
 
-    if (!explicitNickname && nicknameAllocator.availableCount === 0) {
-      throw new Error('No unused name values remain in the identity pool.');
+    if (!['forward', 'reverse'].includes(identityOrder)) {
+      throw new Error(`Identity order must be either "forward" or "reverse". Received: ${identityOrder}`);
     }
 
-    throw new Error(`No unused email entries remain in ${MY_EMAIL_POOL_PATH}`);
-  }
-
-  const selectedCount = Math.min(requestedLimit, maxSelectable);
-  if (selectedCount < requestedLimit) {
-    console.warn(
-      `Requested limit ${requestedLimit} exceeds remaining identity capacity ${selectedCount}. ` +
-        `Continuing with ${selectedCount} email(s).`,
+    const usedIdentities = await readIdentityRecordFile(USED_IDENTITIES_PATH, 'Used identities');
+    const refusedIdentities = await readIdentityRecordFile(REFUSED_IDENTITIES_PATH, 'Refused identities');
+    const reservedIdentities = await readIdentityRecordFile(RESERVED_IDENTITIES_PATH, 'Reserved identities');
+    const names = await loadStringArrayFile(NAMES_POOL_PATH, 'Names pool', { keepEmpty: true });
+    const descriptions = await loadStringArrayFile(DESCRIPTIONS_POOL_PATH, 'Descriptions pool', {
+      keepEmpty: true,
+    });
+    const emailEntries = await loadEmailEntryPoolFile(emailPoolPath, 'My email pool');
+    const blockedEmailSet = new Set(
+      [...usedIdentities, ...refusedIdentities, ...reservedIdentities]
+        .map((entry) => normalizeEmail(entry?.email))
+        .filter(Boolean),
     );
-  }
+    const availableEmailEntries = emailEntries.filter(
+      (entry) => !blockedEmailSet.has(normalizeEmail(entry.email)),
+    );
+    const useReverseOrder = identityOrder === 'reverse';
 
-  return availableEmailEntries.slice(0, selectedCount).map((selectedEmailEntry) => {
-    const resolvedEmail = selectedEmailEntry.email;
-    const existingIdentity = usedIdentities.find(
-      (entry) => normalizeEmail(entry?.email) === normalizeEmail(resolvedEmail),
+    if (availableEmailEntries.length === 0) {
+      throw new Error(`No unused email entries remain in ${emailPoolPath}`);
+    }
+
+    const orderedAvailableEmailEntries = useReverseOrder
+      ? [...availableEmailEntries].reverse()
+      : availableEmailEntries;
+    const selectedEmailEntries = orderedAvailableEmailEntries.slice(0, requestedLimit);
+    const explicitNickname = String(requestedNickname ?? '').trim();
+    const explicitDescription = String(requestedDescription ?? '').trim();
+    const reservedNicknames = [...usedIdentities, ...refusedIdentities, ...reservedIdentities].map(
+      (entry) => entry?.nickname,
+    );
+    const reservedDescriptions = [...usedIdentities, ...refusedIdentities, ...reservedIdentities].map(
+      (entry) => entry?.description,
+    );
+    const nicknameAllocator = explicitNickname
+      ? null
+      : createNameAllocator(names, reservedNicknames, { reverse: useReverseOrder });
+    const descriptionAllocator = explicitDescription
+      ? null
+      : createDescriptionAllocator(descriptions, reservedDescriptions, { reverse: useReverseOrder });
+    const maxSelectable = Math.min(
+      orderedAvailableEmailEntries.length,
+      explicitNickname ? Number.POSITIVE_INFINITY : nicknameAllocator.availableCount,
+      explicitDescription ? Number.POSITIVE_INFINITY : descriptionAllocator.availableCount,
     );
 
-    const resolvedNickname =
-      explicitNickname ||
-      String(existingIdentity?.nickname ?? '').trim() ||
-      nicknameAllocator.pickNext();
+    if (maxSelectable < 1) {
+      if (!explicitDescription && descriptionAllocator.availableCount === 0) {
+        throw new Error('No unused description values remain in the identity pool.');
+      }
 
-    const resolvedDescription =
-      explicitDescription ||
-      String(existingIdentity?.description ?? '').trim() ||
-      descriptionAllocator.pickNext();
+      if (!explicitNickname && nicknameAllocator.availableCount === 0) {
+        throw new Error('No unused name values remain in the identity pool.');
+      }
 
-    if (!explicitNickname) {
-      reservedNicknames.push(resolvedNickname);
+      throw new Error(`No unused email entries remain in ${emailPoolPath}`);
     }
 
-    if (!explicitDescription) {
-      reservedDescriptions.push(resolvedDescription);
+    const selectedCount = Math.min(requestedLimit, maxSelectable);
+    if (selectedCount < requestedLimit) {
+      console.warn(
+        `Requested limit ${requestedLimit} exceeds remaining identity capacity ${selectedCount}. ` +
+          `Continuing with ${selectedCount} email(s).`,
+      );
     }
 
-    return {
-      email: resolvedEmail,
-      timestamp: selectedEmailEntry.timestamp,
-      nickname: resolvedNickname,
-      description: resolvedDescription,
-    };
+    const selectedIdentities = selectedEmailEntries.slice(0, selectedCount).map((selectedEmailEntry) => {
+      const resolvedEmail = selectedEmailEntry.email;
+      const existingIdentity = usedIdentities.find(
+        (entry) => normalizeEmail(entry?.email) === normalizeEmail(resolvedEmail),
+      );
+
+      const resolvedNickname =
+        explicitNickname ||
+        String(existingIdentity?.nickname ?? '').trim() ||
+        nicknameAllocator.pickNext();
+
+      const resolvedDescription =
+        explicitDescription ||
+        String(existingIdentity?.description ?? '').trim() ||
+        descriptionAllocator.pickNext();
+
+      if (!explicitNickname) {
+        reservedNicknames.push(resolvedNickname);
+      }
+
+      if (!explicitDescription) {
+        reservedDescriptions.push(resolvedDescription);
+      }
+
+      return {
+        reservationId: crypto.randomUUID(),
+        reservedAt: new Date().toISOString(),
+        email: resolvedEmail,
+        timestamp: selectedEmailEntry.timestamp,
+        nickname: resolvedNickname,
+        description: resolvedDescription,
+      };
+    });
+
+    await writeJsonFile(RESERVED_IDENTITIES_PATH, [...reservedIdentities, ...selectedIdentities]);
+    return selectedIdentities;
   });
 }
 
@@ -674,39 +752,74 @@ function queueIdentityPoolWrite(task) {
   return queuedTask;
 }
 
+async function releaseReservedIdentity(record) {
+  return queueIdentityPoolWrite(async () => {
+    return withIdentityPoolLock(async () => {
+      const reservedIdentities = await readIdentityRecordFile(RESERVED_IDENTITIES_PATH, 'Reserved identities');
+      const normalizedEmail = normalizeEmail(record?.email);
+      const reservationId = String(record?.reservationId ?? '').trim();
+      const nextReservedIdentities = reservedIdentities.filter((entry) => {
+        if (reservationId && String(entry?.reservationId ?? '').trim() === reservationId) {
+          return false;
+        }
+
+        return normalizeEmail(entry?.email) !== normalizedEmail;
+      });
+
+      await writeJsonFile(RESERVED_IDENTITIES_PATH, nextReservedIdentities);
+    });
+  });
+}
+
 async function recordUsedIdentity(record) {
   return queueIdentityPoolWrite(async () => {
-    const usedIdentities = await readJsonFileWithDefault(USED_IDENTITIES_PATH, []);
-    if (!Array.isArray(usedIdentities)) {
-      throw new Error(`Used identities file must contain a JSON array: ${USED_IDENTITIES_PATH}`);
-    }
+    return withIdentityPoolLock(async () => {
+      const usedIdentities = await readIdentityRecordFile(USED_IDENTITIES_PATH, 'Used identities');
+      const reservedIdentities = await readIdentityRecordFile(RESERVED_IDENTITIES_PATH, 'Reserved identities');
+      const normalizedEmail = normalizeEmail(record?.email);
+      const reservationId = String(record?.reservationId ?? '').trim();
+      const { reservationId: omittedReservationId, ...storedRecord } = record ?? {};
+      const nextUsedIdentities = usedIdentities.filter(
+        (entry) => normalizeEmail(entry?.email) !== normalizedEmail,
+      );
+      const nextReservedIdentities = reservedIdentities.filter((entry) => {
+        if (reservationId && String(entry?.reservationId ?? '').trim() === reservationId) {
+          return false;
+        }
 
-    const normalizedEmail = normalizeEmail(record?.email);
-    const nextPayload = usedIdentities.filter(
-      (entry) => normalizeEmail(entry?.email) !== normalizedEmail,
-    );
+        return normalizeEmail(entry?.email) !== normalizedEmail;
+      });
 
-    nextPayload.push(record);
-    await ensureDirectory(IDENTITY_POOL_DIR);
-    await writeFile(USED_IDENTITIES_PATH, `${JSON.stringify(nextPayload, null, 2)}\n`, 'utf8');
+      nextUsedIdentities.push(storedRecord);
+      await writeJsonFile(USED_IDENTITIES_PATH, nextUsedIdentities);
+      await writeJsonFile(RESERVED_IDENTITIES_PATH, nextReservedIdentities);
+    });
   });
 }
 
 async function recordRefusedIdentity(record) {
   return queueIdentityPoolWrite(async () => {
-    const refusedIdentities = await readJsonFileWithDefault(REFUSED_IDENTITIES_PATH, []);
-    if (!Array.isArray(refusedIdentities)) {
-      throw new Error(`Refused identities file must contain a JSON array: ${REFUSED_IDENTITIES_PATH}`);
-    }
+    return withIdentityPoolLock(async () => {
+      const refusedIdentities = await readIdentityRecordFile(REFUSED_IDENTITIES_PATH, 'Refused identities');
+      const reservedIdentities = await readIdentityRecordFile(RESERVED_IDENTITIES_PATH, 'Reserved identities');
+      const normalizedEmail = normalizeEmail(record?.email);
+      const reservationId = String(record?.reservationId ?? '').trim();
+      const { reservationId: omittedReservationId, ...storedRecord } = record ?? {};
+      const nextRefusedIdentities = refusedIdentities.filter(
+        (entry) => normalizeEmail(entry?.email) !== normalizedEmail,
+      );
+      const nextReservedIdentities = reservedIdentities.filter((entry) => {
+        if (reservationId && String(entry?.reservationId ?? '').trim() === reservationId) {
+          return false;
+        }
 
-    const normalizedEmail = normalizeEmail(record?.email);
-    const nextPayload = refusedIdentities.filter(
-      (entry) => normalizeEmail(entry?.email) !== normalizedEmail,
-    );
+        return normalizeEmail(entry?.email) !== normalizedEmail;
+      });
 
-    nextPayload.push(record);
-    await ensureDirectory(IDENTITY_POOL_DIR);
-    await writeFile(REFUSED_IDENTITIES_PATH, `${JSON.stringify(nextPayload, null, 2)}\n`, 'utf8');
+      nextRefusedIdentities.push(storedRecord);
+      await writeJsonFile(REFUSED_IDENTITIES_PATH, nextRefusedIdentities);
+      await writeJsonFile(RESERVED_IDENTITIES_PATH, nextReservedIdentities);
+    });
   });
 }
 
@@ -1206,6 +1319,7 @@ async function runSingleLoginSession({
   batchTotal,
 }) {
   const resolvedEmail = String(identitySelection.email ?? '').trim();
+  const reservationId = String(identitySelection.reservationId ?? '').trim();
   const resolvedNickname = String(identitySelection.nickname ?? '').trim();
   const resolvedDescription = String(identitySelection.description ?? '').trim();
   const mailboxTimestamp = String(identitySelection.timestamp ?? '').trim();
@@ -1248,6 +1362,7 @@ async function runSingleLoginSession({
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await recordRefusedIdentity({
+      reservationId,
       email: resolvedEmail,
       nickname: resolvedNickname,
       description: resolvedDescription,
@@ -1309,6 +1424,7 @@ async function runSingleLoginSession({
   });
 
   await recordUsedIdentity({
+    reservationId,
     email: resolvedEmail,
     nickname: resolvedNickname,
     description: resolvedDescription,
@@ -1362,6 +1478,13 @@ function loadRuntimeConfig(args, envFile) {
   const resolvedProjectId = String(
     readSetting(args, envFile, 'project-id', 'SURGE_PROJECT_ID', DEFAULT_PROJECT_ID) ?? '',
   ).trim();
+  const rawEmailPoolPath = String(
+    readSetting(args, envFile, 'email-pool-file', 'SURGE_EMAIL_POOL_FILE', MY_EMAIL_POOL_PATH) ??
+      MY_EMAIL_POOL_PATH,
+  ).trim();
+  const identityOrder = String(
+    readSetting(args, envFile, 'identity-order', 'SURGE_IDENTITY_ORDER', 'forward') ?? 'forward',
+  ).trim().toLowerCase();
   const allocationAmount = readIntegerSetting(args, envFile, {
     argKey: 'amount',
     envKey: 'SURGE_PROJECT_IGNITES',
@@ -1410,6 +1533,14 @@ function loadRuntimeConfig(args, envFile) {
     throw new Error('Project id is required. Pass --project-id or set SURGE_PROJECT_ID.');
   }
 
+  if (!rawEmailPoolPath) {
+    throw new Error('Email pool file is required. Pass --email-pool-file or set SURGE_EMAIL_POOL_FILE.');
+  }
+
+  if (!['forward', 'reverse'].includes(identityOrder)) {
+    throw new Error(`Identity order must be either "forward" or "reverse". Received: ${identityOrder}`);
+  }
+
   if (batchDelayMaxMs < batchDelayMinMs) {
     throw new Error(`Batch delay max must be greater than or equal to batch delay min. Received: min=${batchDelayMinMs}, max=${batchDelayMaxMs}`);
   }
@@ -1419,6 +1550,10 @@ function loadRuntimeConfig(args, envFile) {
     requestedNickname,
     requestedDescription,
     resolvedProjectId,
+    emailPoolPath: path.isAbsolute(rawEmailPoolPath)
+      ? rawEmailPoolPath
+      : path.resolve(projectRoot, rawEmailPoolPath),
+    identityOrder,
     allocationAmount,
     captchaToken,
     otpWaitMs,
@@ -1444,6 +1579,8 @@ async function main() {
     requestedNickname,
     requestedDescription,
     resolvedProjectId,
+    emailPoolPath,
+    identityOrder,
     allocationAmount,
     captchaToken,
     otpWaitMs,
@@ -1457,6 +1594,8 @@ async function main() {
     requestedNickname,
     requestedDescription,
     limit: requestedLimit,
+    emailPoolPath,
+    identityOrder,
   });
   const batchResults = [];
   const batchTotal = identitySelections.length;
@@ -1482,6 +1621,8 @@ async function main() {
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+
+      await releaseReservedIdentity(identitySelection);
       batchResults.push(createBatchFailureResult(batchIndex, identitySelection.email, message));
 
       if (message !== 'otp-refused') {

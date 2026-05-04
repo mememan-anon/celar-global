@@ -9,11 +9,17 @@
     "fetch:ignite:full": "node ./scripts/fetch-ignite-leaderboard-full.mjs",
     "start": "npx serve .",
     "mojo": "node ./scripts/runner.mjs",
+    "mojo:outlook": "node ./scripts/runner.mjs --email-pool-file ./data/identity-pool/my-emails-outlook.json --identity-order reverse",
     "pm2:start": "pm2 start ./scripts/runner.mjs --name celar-runner --interpreter node",
+    "pm2:start:outlook": "pm2 start ./scripts/runner.mjs --name celar-runner-outlook --interpreter node -- --email-pool-file ./data/identity-pool/my-emails-outlook.json --identity-order reverse",
     "pm2:restart": "pm2 restart celar-runner",
+    "pm2:restart:outlook": "pm2 restart celar-runner-outlook",
     "pm2:stop": "pm2 stop celar-runner",
+    "pm2:stop:outlook": "pm2 stop celar-runner-outlook",
     "pm2:delete": "pm2 delete celar-runner",
-    "pm2:logs": "pm2 logs celar-runner"
+    "pm2:delete:outlook": "pm2 delete celar-runner-outlook",
+    "pm2:logs": "pm2 logs celar-runner celar-runner-outlook",
+    "pm2:logs:outlook": "pm2 logs celar-runner-outlook"
   },
   "dependencies": {
     "playwright": "^1.59.1",
