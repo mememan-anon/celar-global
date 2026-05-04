@@ -1220,13 +1220,6 @@ async function runSingleLoginSession({
     throw new Error(`Mailbox timestamp is required from ${MY_EMAIL_POOL_PATH} for ${resolvedEmail}.`);
   }
 
-  const preOtpJitterMs = randomIntegerBetween(
-    DEFAULT_PRE_OTP_JITTER_MIN_MS,
-    DEFAULT_PRE_OTP_JITTER_MAX_MS,
-  );
-  console.log(`${logPrefix}Waiting ${preOtpJitterMs}ms before requesting OTP for ${resolvedEmail} ...`);
-  await sleep(preOtpJitterMs);
-
   console.log(`${logPrefix}Sending OTP to ${resolvedEmail} using SonJJ ${mailboxConfig.provider} mailbox ...`);
 
   const clientAnalyticsId = crypto.randomUUID();
