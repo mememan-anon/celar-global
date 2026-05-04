@@ -19,8 +19,10 @@ const DEFAULT_PROJECT_IGNITES = 10; //dont touch at all
 const DEFAULT_EMAIL_LIMIT =  2100;
 const DEFAULT_WAVE_CONCURRENCY_MIN = 1;
 const DEFAULT_WAVE_CONCURRENCY_MAX = 5;
-const DEFAULT_BATCH_DELAY_MIN_MS = 5000;   // 5 seconds
-const DEFAULT_BATCH_DELAY_MAX_MS = 60000;  // 60 seconds
+const DEFAULT_BATCH_DELAY_MIN_MS = 30000;   // 30 seconds
+const DEFAULT_BATCH_DELAY_MAX_MS = 90000;  // 90 seconds
+const DEFAULT_PRE_OTP_JITTER_MIN_MS = 5000;   // 5 seconds
+const DEFAULT_PRE_OTP_JITTER_MAX_MS = 20000;  // 20 seconds
 const DEFAULT_OTP_WAIT_MS = 10000;
 const DEFAULT_OTP_POLL_ATTEMPTS = 2;
 const DEFAULT_NETWORK_RETRY_ATTEMPTS = 2;
@@ -1221,6 +1223,13 @@ async function runSingleLoginSession({
   if (!isNumericString(mailboxTimestamp)) {
     throw new Error(`Mailbox timestamp is required from ${MY_EMAIL_POOL_PATH} for ${resolvedEmail}.`);
   }
+
+  const preOtpJitterMs = randomIntegerBetween(
+    DEFAULT_PRE_OTP_JITTER_MIN_MS,
+    DEFAULT_PRE_OTP_JITTER_MAX_MS,
+  );
+  console.log(`${logPrefix}Waiting ${preOtpJitterMs}ms before requesting OTP for ${resolvedEmail} ...`);
+  await sleep(preOtpJitterMs);
 
   console.log(`${logPrefix}Sending OTP to ${resolvedEmail} using SonJJ ${mailboxConfig.provider} mailbox ...`);
 
