@@ -16,9 +16,11 @@ const DEFAULT_MODE = 'login-or-sign-up';
 const SONJJ_BASE_URL = 'https://app.sonjj.com';
 const DEFAULT_PROJECT_ID = '28';
 const DEFAULT_PROJECT_IGNITES = 10; //dont touch
-const DEFAULT_EMAIL_LIMIT =  500;
+const DEFAULT_EMAIL_LIMIT =  2100;
+const DEFAULT_WAVE_CONCURRENCY_MIN = 1;
+const DEFAULT_WAVE_CONCURRENCY_MAX = 10;
 const DEFAULT_BATCH_DELAY_MIN_MS = 5000;   // 5 seconds
-const DEFAULT_BATCH_DELAY_MAX_MS = 60000;  // 30 seconds
+const DEFAULT_BATCH_DELAY_MAX_MS = 60000;  // 60 seconds
 const DEFAULT_OTP_WAIT_MS = 10000;
 const DEFAULT_OTP_POLL_ATTEMPTS = 2;
 const DEFAULT_NETWORK_RETRY_ATTEMPTS = 2;
@@ -44,6 +46,7 @@ const MY_EMAIL_POOL_PATH = path.join(IDENTITY_POOL_DIR, 'my-email.json');
 const USED_IDENTITIES_PATH = path.join(IDENTITY_POOL_DIR, 'used-identities.json');
 const REFUSED_IDENTITIES_PATH = path.join(IDENTITY_POOL_DIR, 'refused-identities.json');
 const MESSAGE_ARRAY_HINT_KEYS = ['data', 'messages', 'items', 'results', 'value'];
+let identityPoolWriteQueue = Promise.resolve();
 
 function parseArgs(argv) {
   const args = {};
@@ -667,36 +670,46 @@ async function resolveIdentitySelections({ requestedNickname, requestedDescripti
   });
 }
 
+function queueIdentityPoolWrite(task) {
+  const queuedTask = identityPoolWriteQueue.then(task, task);
+  identityPoolWriteQueue = queuedTask.catch(() => {});
+  return queuedTask;
+}
+
 async function recordUsedIdentity(record) {
-  const usedIdentities = await readJsonFileWithDefault(USED_IDENTITIES_PATH, []);
-  if (!Array.isArray(usedIdentities)) {
-    throw new Error(`Used identities file must contain a JSON array: ${USED_IDENTITIES_PATH}`);
-  }
+  return queueIdentityPoolWrite(async () => {
+    const usedIdentities = await readJsonFileWithDefault(USED_IDENTITIES_PATH, []);
+    if (!Array.isArray(usedIdentities)) {
+      throw new Error(`Used identities file must contain a JSON array: ${USED_IDENTITIES_PATH}`);
+    }
 
-  const normalizedEmail = normalizeEmail(record?.email);
-  const nextPayload = usedIdentities.filter(
-    (entry) => normalizeEmail(entry?.email) !== normalizedEmail,
-  );
+    const normalizedEmail = normalizeEmail(record?.email);
+    const nextPayload = usedIdentities.filter(
+      (entry) => normalizeEmail(entry?.email) !== normalizedEmail,
+    );
 
-  nextPayload.push(record);
-  await ensureDirectory(IDENTITY_POOL_DIR);
-  await writeFile(USED_IDENTITIES_PATH, `${JSON.stringify(nextPayload, null, 2)}\n`, 'utf8');
+    nextPayload.push(record);
+    await ensureDirectory(IDENTITY_POOL_DIR);
+    await writeFile(USED_IDENTITIES_PATH, `${JSON.stringify(nextPayload, null, 2)}\n`, 'utf8');
+  });
 }
 
 async function recordRefusedIdentity(record) {
-  const refusedIdentities = await readJsonFileWithDefault(REFUSED_IDENTITIES_PATH, []);
-  if (!Array.isArray(refusedIdentities)) {
-    throw new Error(`Refused identities file must contain a JSON array: ${REFUSED_IDENTITIES_PATH}`);
-  }
+  return queueIdentityPoolWrite(async () => {
+    const refusedIdentities = await readJsonFileWithDefault(REFUSED_IDENTITIES_PATH, []);
+    if (!Array.isArray(refusedIdentities)) {
+      throw new Error(`Refused identities file must contain a JSON array: ${REFUSED_IDENTITIES_PATH}`);
+    }
 
-  const normalizedEmail = normalizeEmail(record?.email);
-  const nextPayload = refusedIdentities.filter(
-    (entry) => normalizeEmail(entry?.email) !== normalizedEmail,
-  );
+    const normalizedEmail = normalizeEmail(record?.email);
+    const nextPayload = refusedIdentities.filter(
+      (entry) => normalizeEmail(entry?.email) !== normalizedEmail,
+    );
 
-  nextPayload.push(record);
-  await ensureDirectory(IDENTITY_POOL_DIR);
-  await writeFile(REFUSED_IDENTITIES_PATH, `${JSON.stringify(nextPayload, null, 2)}\n`, 'utf8');
+    nextPayload.push(record);
+    await ensureDirectory(IDENTITY_POOL_DIR);
+    await writeFile(REFUSED_IDENTITIES_PATH, `${JSON.stringify(nextPayload, null, 2)}\n`, 'utf8');
+  });
 }
 
 function sleep(ms) {
@@ -1323,6 +1336,69 @@ async function runSingleLoginSession({
   };
 }
 
+function createBatchSuccessResult(batchIndex, email, allocationStatus) {
+  const isRefused = allocationStatus === 'refused';
+
+  return {
+    batchIndex: batchIndex + 1,
+    email,
+    ok: !isRefused,
+    allocationStatus,
+    ...(isRefused ? { error: 'otp-refused' } : {}),
+  };
+}
+
+function createBatchFailureResult(batchIndex, email, error) {
+  return {
+    batchIndex: batchIndex + 1,
+    email,
+    ok: false,
+    error,
+  };
+}
+
+async function runBatchWave({
+  identitySelections,
+  startIndex,
+  waveConcurrency,
+  batchTotal,
+  inviteCode,
+  resolvedProjectId,
+  allocationAmount,
+  captchaToken,
+  otpWaitMs,
+  otpPollAttempts,
+  sonjjApiKey,
+}) {
+  const waveEntries = identitySelections.slice(startIndex, startIndex + waveConcurrency);
+
+  return Promise.all(
+    waveEntries.map(async (identitySelection, waveOffset) => {
+      const batchIndex = startIndex + waveOffset;
+
+      try {
+        const result = await runSingleLoginSession({
+          inviteCode,
+          resolvedProjectId,
+          allocationAmount,
+          captchaToken,
+          otpWaitMs,
+          otpPollAttempts,
+          sonjjApiKey,
+          identitySelection,
+          batchIndex,
+          batchTotal,
+        });
+
+        return createBatchSuccessResult(batchIndex, identitySelection.email, result.allocationStatus);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return createBatchFailureResult(batchIndex, identitySelection.email, message);
+      }
+    }),
+  );
+}
+
 function loadRuntimeConfig(args, envFile) {
   const inviteCode = readSetting(args, envFile, 'invite', 'SURGE_INVITE_CODE', '');
   const requestedNickname = readSetting(args, envFile, 'nickname', 'SURGE_PROFILE_NICKNAME', '');
@@ -1421,27 +1497,6 @@ async function main() {
     batchDelayMaxMs,
   } = runtimeConfig;
 
-function createBatchSuccessResult(batchIndex, email, allocationStatus) {
-  const isRefused = allocationStatus === 'refused';
-
-  return {
-    batchIndex: batchIndex + 1,
-    email,
-    ok: !isRefused,
-    allocationStatus,
-    ...(isRefused ? { error: 'otp-refused' } : {}),
-  };
-}
-
-function createBatchFailureResult(batchIndex, email, error) {
-  return {
-    batchIndex: batchIndex + 1,
-    email,
-    ok: false,
-    error,
-  };
-}
-
   const identitySelections = await resolveIdentitySelections({
     requestedNickname,
     requestedDescription,
@@ -1449,39 +1504,47 @@ function createBatchFailureResult(batchIndex, email, error) {
   });
   const batchResults = [];
   const batchTotal = identitySelections.length;
+  let nextStartIndex = 0;
 
-  for (const [batchIndex, identitySelection] of identitySelections.entries()) {
-    try {
-      const result = await runSingleLoginSession({
-        inviteCode,
-        resolvedProjectId,
-        allocationAmount,
-        captchaToken,
-        otpWaitMs,
-        otpPollAttempts,
-        sonjjApiKey,
-        identitySelection,
-        batchIndex,
-        batchTotal,
-      });
+  while (nextStartIndex < batchTotal) {
+    const remainingCount = batchTotal - nextStartIndex;
+    const waveConcurrency = Math.min(
+      randomIntegerBetween(DEFAULT_WAVE_CONCURRENCY_MIN, DEFAULT_WAVE_CONCURRENCY_MAX),
+      remainingCount,
+    );
 
-      batchResults.push(
-        createBatchSuccessResult(batchIndex, identitySelection.email, result.allocationStatus),
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      batchResults.push(createBatchFailureResult(batchIndex, identitySelection.email, message));
+    console.log(
+      `Starting wave at item ${nextStartIndex + 1}/${batchTotal}. ` +
+        `Running ${waveConcurrency} identities at the same time in this wave.`,
+    );
 
-      if (batchTotal <= 1) {
-        throw error;
+    const waveResults = await runBatchWave({
+      identitySelections,
+      startIndex: nextStartIndex,
+      waveConcurrency,
+      batchTotal,
+      inviteCode,
+      resolvedProjectId,
+      allocationAmount,
+      captchaToken,
+      otpWaitMs,
+      otpPollAttempts,
+      sonjjApiKey,
+    });
+
+    batchResults.push(...waveResults);
+
+    for (const result of waveResults) {
+      if (!result.ok && result.error !== 'otp-refused') {
+        console.error(`[${result.batchIndex}/${batchTotal}] ${result.error}`);
       }
-
-      console.error(`[${batchIndex + 1}/${batchTotal}] ${message}`);
     }
 
-    if (batchIndex < batchTotal - 1) {
+    nextStartIndex += waveConcurrency;
+
+    if (nextStartIndex < batchTotal) {
       const interEmailDelayMs = randomIntegerBetween(batchDelayMinMs, batchDelayMaxMs);
-      console.log(`[${batchIndex + 1}/${batchTotal}] Waiting ${interEmailDelayMs}ms before starting next email ...`);
+      console.log(`Wave completed. Waiting ${interEmailDelayMs}ms before starting next wave ...`);
       await sleep(interEmailDelayMs);
     }
   }
