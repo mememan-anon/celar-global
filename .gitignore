@@ -6,4 +6,10 @@ docs
 # scripts
 # git restore --source=HEAD --staged --worktree scripts/runner.mjs
 # git add scripts/runner.mjs
-
+# identity pool runtime state
+/data/identity-pool/refused-identities.json
+/data/identity-pool/used-identities.json
+/data/identity-pool/reserved-identities.json
+refused-identities.json
+used-identities.json
+reserved-identities.json
