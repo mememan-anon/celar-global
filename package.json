@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "npx serve .",
     "fetch:ignite": "node ./scripts/fetch-ignite-leaderboard.mjs",
+    "snapshot:ignite:accounts": "node ./scripts/snapshot-ignite-accounts.mjs",
     "fetch:ignite:full": "node ./scripts/fetch-ignite-leaderboard-full.mjs",
     "start": "npx serve .",
     "mojo": "node ./scripts/runner.mjs",
@@ -19,7 +20,14 @@
     "pm2:delete": "pm2 delete celar-runner",
     "pm2:delete:outlook": "pm2 delete celar-runner-outlook",
     "pm2:logs": "pm2 logs celar-runner celar-runner-outlook",
-    "pm2:logs:outlook": "pm2 logs celar-runner-outlook"
+    "pm2:logs:outlook": "pm2 logs celar-runner-outlook",
+    "surge:inspect-latest": "node ./scripts/inspect-surge-latest.mjs",
+    "surge:connect-x": "node ./scripts/connect-x-social.mjs",
+    "surge:list-endpoints": "node ./scripts/list-surge-endpoints.mjs",
+    "surge:classify-gets": "node ./scripts/classify-surge-get-endpoints.mjs",
+    "surge:test-get-endpoints": "node ./scripts/run-surge-get-endpoints.mjs",
+    "surge:project6-x": "node ./scripts/runner-project6-x-connect.mjs",
+    "x:oauth2": "node ./scripts/x-oauth2-pkce-token.mjs"
   },
   "dependencies": {
     "playwright": "^1.59.1",

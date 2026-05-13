@@ -13,3 +13,7 @@ docs
 refused-identities.json
 used-identities.json
 reserved-identities.json
+rara.json
+/data/identity-pool/discovered-endpoints-with-methods.md
+/data/identity-pool/you-auth-pool.txt
+/data/ignite-account-snapshots

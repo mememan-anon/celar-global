@@ -2,6 +2,8 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import nodeCrypto from 'node:crypto';
+import { chromium } from 'playwright';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -9,13 +11,15 @@ const projectRoot = path.resolve(__dirname, '..');
 const envPath = path.join(projectRoot, '.env');
 
 const SURGE_APP_ORIGIN = 'https://app.surge.xyz';
+const SURGE_WEB_ORIGIN = 'https://surge.xyz';
 const SURGE_BACKEND_URL = 'https://back.surge.xyz';
 const PRIVY_BASE_URL = 'https://auth.privy.io';
 const PRIVY_APP_ID = 'cmheubr2q0175h20c1a8xcg3l';
 const DEFAULT_MODE = 'login-or-sign-up';
 const SONJJ_BASE_URL = 'https://app.sonjj.com';
 const DEFAULT_PROJECT_ID = '28';
-const DEFAULT_PROJECT_IGNITES = 10; //dont touch at all
+const DEFAULT_PROJECT_IGNITES = 'max';
+const DEFAULT_MAX_PROJECT_IGNITES = 15;
 const DEFAULT_EMAIL_LIMIT =  2100;
 const DEFAULT_BATCH_DELAY_MIN_MS = 5000;   // 5 seconds
 const DEFAULT_BATCH_DELAY_MAX_MS = 30000;  // 30 seconds
@@ -42,6 +46,7 @@ const NAMES_POOL_PATH = path.join(IDENTITY_POOL_DIR, 'names.json');
 const DESCRIPTIONS_POOL_PATH = path.join(IDENTITY_POOL_DIR, 'descriptions.json');
 const MY_EMAIL_POOL_PATH = path.join(IDENTITY_POOL_DIR, 'my-email.json');
 const USED_IDENTITIES_PATH = path.join(IDENTITY_POOL_DIR, 'used-identities.json');
+const X_AUTH_POOL_PATH = path.join(IDENTITY_POOL_DIR, 'you-auth-pool.txt');
 const REFUSED_IDENTITIES_PATH = path.join(IDENTITY_POOL_DIR, 'refused-identities.json');
 const RESERVED_IDENTITIES_PATH = path.join(IDENTITY_POOL_DIR, 'reserved-identities.json');
 const IDENTITY_POOL_LOCK_PATH = path.join(IDENTITY_POOL_DIR, '.identity-pool.lock');
@@ -255,15 +260,16 @@ async function fetchJsonWithCookies(jar, url, options = {}) {
   };
 }
 
-function buildPrivyHeaders(clientAnalyticsId) {
+function buildPrivyHeaders(clientAnalyticsId, privyAccessToken = '', origin = SURGE_APP_ORIGIN) {
   return {
     Accept: 'application/json',
     'Content-Type': 'application/json',
-    Origin: SURGE_APP_ORIGIN,
-    Referer: `${SURGE_APP_ORIGIN}/`,
+    Origin: origin,
+    Referer: `${origin}/`,
+    ...(privyAccessToken ? { Authorization: `Bearer ${privyAccessToken}` } : {}),
     'privy-app-id': PRIVY_APP_ID,
     'privy-ca-id': clientAnalyticsId,
-    'privy-client': 'surge-headless-script/1.0',
+    'privy-client': 'react-auth:2.25.0',
   };
 }
 
@@ -335,6 +341,243 @@ async function fetchAuthedJson(accessToken, endpointPath, { method = 'GET', body
   }
 
   return data;
+}
+
+function stripWrappingQuotes(value) {
+  const text = String(value ?? '').trim();
+  if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+    return text.slice(1, -1).trim();
+  }
+
+  return text;
+}
+
+function normalizeBearerToken(value) {
+  const token = stripWrappingQuotes(value);
+  return token.toLowerCase().startsWith('bearer ') ? token.slice(7).trim() : token;
+}
+
+function createPkcePair() {
+  const verifier = nodeCrypto.randomBytes(36).toString('base64url');
+  const challenge = nodeCrypto.createHash('sha256').update(verifier).digest('base64url');
+  return { verifier, challenge };
+}
+
+function createStateCode() {
+  return nodeCrypto.randomBytes(36).toString('base64url');
+}
+
+async function runXPrivyOAuthLinkInBrowser({ connectUrl, xAuthToken }) {
+  const normalizedUrl = connectUrl.replace(/^https:\/\/twitter\.com\//i, 'https://x.com/');
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext();
+  const cookieExpires = Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 30;
+  const twitterCookies = ['.twitter.com', 'twitter.com', '.x.com', 'x.com'].map((domain) => ({
+    name: 'auth_token',
+    value: xAuthToken,
+    domain,
+    path: '/',
+    httpOnly: true,
+    secure: true,
+    sameSite: 'None',
+    expires: cookieExpires,
+  }));
+
+  try {
+    await context.addCookies(twitterCookies);
+    const observedUrls = [];
+    const messages = [];
+    const rememberUrl = (url) => {
+      if (typeof url === 'string' && url && !observedUrls.includes(url)) {
+        observedUrls.push(url);
+      }
+    };
+
+    const opener = await context.newPage();
+    await opener.exposeFunction('capturePrivyOAuthMessage', (payload) => {
+      messages.push(payload);
+    });
+    await opener.addInitScript(() => {
+      window.addEventListener('message', (event) => {
+        window.capturePrivyOAuthMessage({ origin: event.origin, data: event.data });
+      });
+    });
+    await opener.goto(`${SURGE_WEB_ORIGIN}/`, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+
+    const popupPromise = opener.waitForEvent('popup', { timeout: 15000 }).catch(() => null);
+    await opener.evaluate((url) => window.open(url, '_blank', 'popup=1,width=440,height=680'), normalizedUrl);
+    const page = (await popupPromise) ?? opener;
+    page.on('request', (request) => rememberUrl(request.url()));
+    page.on('response', (response) => rememberUrl(response.url()));
+
+    for (let attempt = 0; attempt < 35; attempt += 1) {
+      rememberUrl(page.url());
+      const oauthMessage = messages.find((message) => message?.data?.type === 'PRIVY_OAUTH_RESPONSE');
+      if (oauthMessage) {
+        await page.waitForTimeout(1000);
+        break;
+      }
+
+      await page
+        .evaluate(() => {
+          const labels = ['Authorize app', 'Authorize', 'Allow', 'Connect', 'Sign in', 'Log in'];
+          const elements = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a'));
+          const target = elements.find((element) => {
+            const text = `${element.innerText || element.textContent || element.value || element.getAttribute('aria-label') || ''}`.trim().toLowerCase();
+            return labels.some((label) => text === label.toLowerCase() || text.includes(label.toLowerCase()));
+          });
+
+          if (target) {
+            target.click();
+          }
+        })
+        .catch(() => {});
+      await page.waitForTimeout(2000);
+    }
+
+    const finalUrl = page.url();
+    rememberUrl(finalUrl);
+    const callbackUrl = observedUrls.find((url) => url.includes('auth.privy.io/api/v1/oauth/callback')) || '';
+    const callbackSearchParams = callbackUrl ? new URL(callbackUrl).searchParams : new URLSearchParams();
+    const finalSearchParams = new URL(finalUrl).searchParams;
+    const oauthMessage = messages.find((message) => message?.data?.type === 'PRIVY_OAUTH_RESPONSE') ?? null;
+    const authorizationCode =
+      oauthMessage?.data?.authorizationCode ||
+      oauthMessage?.data?.authorization_code ||
+      finalSearchParams.get('privy_oauth_code') ||
+      callbackSearchParams.get('code') ||
+      callbackSearchParams.get('authorization_code') ||
+      finalSearchParams.get('code') ||
+      finalSearchParams.get('authorization_code') ||
+      '';
+    const returnedState =
+      oauthMessage?.data?.stateCode ||
+      oauthMessage?.data?.state_code ||
+      finalSearchParams.get('privy_oauth_state') ||
+      callbackSearchParams.get('state') ||
+      callbackSearchParams.get('state_code') ||
+      finalSearchParams.get('state') ||
+      finalSearchParams.get('state_code') ||
+      '';
+
+    return { finalUrl, callbackUrl, observedUrls, oauthMessage, authorizationCode, returnedState };
+  } finally {
+    await browser.close();
+  }
+}
+
+async function requestPrivyOAuthLink({ cookieJar, clientAnalyticsId, privyAccessToken, authorizationCode, returnedState, codeVerifier }) {
+  const link = await fetchJsonWithCookies(cookieJar, `${PRIVY_BASE_URL}/api/v1/oauth/link`, {
+    method: 'POST',
+    headers: buildPrivyHeaders(clientAnalyticsId, privyAccessToken, SURGE_WEB_ORIGIN),
+    body: JSON.stringify({
+      authorization_code: authorizationCode,
+      state_code: returnedState,
+      code_verifier: codeVerifier,
+    }),
+  });
+
+  if (!link.ok && link.data?.code !== 'cannot_link_more_of_type') {
+    throw new Error(`Privy X OAuth link failed with ${link.status}: ${JSON.stringify(link.data)}`);
+  }
+
+  return {
+    ok: link.ok,
+    alreadyLinked: link.data?.code === 'cannot_link_more_of_type',
+    data: link.data,
+  };
+}
+
+async function syncSurgePrivyUser({ accessToken, privyAccessToken, logPrefix }) {
+  const response = await fetch(`${SURGE_BACKEND_URL}/auth/privy`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      Origin: SURGE_APP_ORIGIN,
+      Referer: `${SURGE_APP_ORIGIN}/`,
+    },
+    body: JSON.stringify({ token: privyAccessToken }),
+  });
+  const text = await response.text();
+  const data = tryParseJsonText(text);
+  console.log(`${logPrefix}/auth/privy sync response ${response.status}: ${JSON.stringify(data).slice(0, 500)}`);
+}
+
+async function connectXAccountWithPrivyOAuthLink({ cookieJar, clientAnalyticsId, accessToken, privyAccessToken, xAuthToken, logPrefix }) {
+  if (!xAuthToken) {
+    console.log(`${logPrefix}No X auth token provided; skipping X Privy OAuth link attempt.`);
+    return false;
+  }
+
+  if (!privyAccessToken) {
+    console.log(`${logPrefix}No Privy access token returned from email auth; skipping X Privy OAuth link attempt.`);
+    return false;
+  }
+
+  const pkce = createPkcePair();
+  const stateCode = createStateCode();
+  console.log(`${logPrefix}Issuing Privy X OAuth link URL ...`);
+  const init = await fetchJsonWithCookies(cookieJar, `${PRIVY_BASE_URL}/api/v1/oauth/init`, {
+    method: 'POST',
+    headers: buildPrivyHeaders(clientAnalyticsId, privyAccessToken, SURGE_WEB_ORIGIN),
+    body: JSON.stringify({
+      provider: 'twitter',
+      redirect_to: `${SURGE_WEB_ORIGIN}/`,
+      code_challenge: pkce.challenge,
+      state_code: stateCode,
+    }),
+  });
+
+  if (!init.ok) {
+    throw new Error(`Privy X OAuth init failed with ${init.status}: ${JSON.stringify(init.data)}`);
+  }
+
+  const connectUrl = init.data?.url || init.data?.connectUrl || init.data?.authorizationUrl || '';
+  if (!connectUrl) {
+    throw new Error(`Privy X OAuth init did not return URL: ${JSON.stringify(init.data)}`);
+  }
+
+  console.log(`${logPrefix}Authorizing X app in browser for Privy link ...`);
+  const browserResult = await runXPrivyOAuthLinkInBrowser({ connectUrl, xAuthToken });
+  console.log(`${logPrefix}Privy X OAuth final URL: ${browserResult.finalUrl}`);
+  if (!browserResult.authorizationCode) {
+    throw new Error(`Privy X OAuth did not return authorization code. Observed URLs: ${browserResult.observedUrls.slice(-10).join(' | ')}`);
+  }
+
+  const linkResult = await requestPrivyOAuthLink({
+    cookieJar,
+    clientAnalyticsId,
+    privyAccessToken,
+    authorizationCode: browserResult.authorizationCode,
+    returnedState: browserResult.returnedState || stateCode,
+    codeVerifier: pkce.verifier,
+  });
+  if (linkResult.alreadyLinked) {
+    console.log(`${logPrefix}Privy X OAuth link already exists for this account type; syncing Surge user instead.`);
+  } else {
+    console.log(`${logPrefix}Privy X OAuth link result: ${JSON.stringify(linkResult.data).slice(0, 1000)}`);
+  }
+
+  await syncSurgePrivyUser({ accessToken, privyAccessToken, logPrefix });
+
+  for (let attemptNumber = 1; attemptNumber <= 3; attemptNumber += 1) {
+    const meAfterLink = await fetchAuthedJson(accessToken, '/auth/me');
+    const socials = getAuthMeSocials(meAfterLink);
+    console.log(`${logPrefix}/auth/me socials after Privy X link attempt ${attemptNumber}/3: ${JSON.stringify(socials)}`);
+
+    if (hasXSocialConnection(meAfterLink)) {
+      return true;
+    }
+
+    if (attemptNumber < 3) {
+      await syncSurgePrivyUser({ accessToken, privyAccessToken, logPrefix });
+      await sleep(2000);
+    }
+  }
+
+  return false;
 }
 
 function findProjectAllocations(projectCapacity, projectId) {
@@ -495,8 +738,136 @@ async function loadEmailEntryPoolFile(filePath, label) {
   return payload.entries.map((entry, index) => validateEmailPoolEntry(entry, index, filePath, label));
 }
 
+function normalizeXAuthPoolEntry(line, index, filePath, label) {
+  const xAuthToken = normalizeBearerToken(line);
+  if (!xAuthToken) {
+    throw new Error(`${label} entry at line ${index + 1} is missing an X auth token in ${filePath}`);
+  }
+
+  return { xAuthToken };
+}
+
+async function loadXAuthPoolFile(filePath, label) {
+  if (!existsSync(filePath)) {
+    return [];
+  }
+
+  const raw = await readFile(filePath, 'utf8');
+  if (!raw.trim()) {
+    return [];
+  }
+
+  return raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#'))
+    .map((line, index) => normalizeXAuthPoolEntry(line, index, filePath, label));
+}
+
 function normalizeEmail(value) {
   return String(value ?? '').trim().toLowerCase();
+}
+
+function normalizeXAuthTokenForIdentity(value) {
+  return normalizeBearerToken(value).toLowerCase();
+}
+
+function buildBlockedIdentitySets(identityRecords) {
+  return {
+    emails: new Set(
+      identityRecords
+        .map((entry) => normalizeEmail(entry?.email))
+        .filter(Boolean),
+    ),
+    xAuthTokens: new Set(
+      identityRecords
+        .map((entry) => normalizeXAuthTokenForIdentity(entry?.xAuthToken))
+        .filter(Boolean),
+    ),
+  };
+}
+
+function filterAvailableUniqueXAuthEntries(rawXAuthEntries, blockedXAuthTokenSet) {
+  const seenXAuthTokenSet = new Set(blockedXAuthTokenSet);
+  const availableEntries = [];
+
+  for (const entry of rawXAuthEntries) {
+    const normalizedXAuthToken = normalizeXAuthTokenForIdentity(entry?.xAuthToken);
+    if (!normalizedXAuthToken || seenXAuthTokenSet.has(normalizedXAuthToken)) {
+      continue;
+    }
+
+    seenXAuthTokenSet.add(normalizedXAuthToken);
+    availableEntries.push(entry);
+  }
+
+  return availableEntries;
+}
+
+function isXSocialRecord(social) {
+  const candidates = [
+    social?.type,
+    social?.provider,
+    social?.platform,
+    social?.name,
+    social?.providerType,
+    social?.accountType,
+  ];
+
+  return candidates.some((candidate) => {
+    const normalized = String(candidate ?? '').trim().toLowerCase();
+    return normalized === 'x' || normalized === 'twitter' || normalized === 'twitter_oauth' || normalized.includes('twitter');
+  });
+}
+
+function hasXSocialConnection(mePayload) {
+  const socials = Array.isArray(mePayload?.user?.socials) ? mePayload.user.socials : [];
+  return socials.some(isXSocialRecord);
+}
+
+function getAuthMeSocials(mePayload) {
+  return Array.isArray(mePayload?.user?.socials) ? mePayload.user.socials : [];
+}
+
+function findBlockedIdentityConflict(identitySelection, blockedSets) {
+  const normalizedEmail = normalizeEmail(identitySelection?.email);
+  if (normalizedEmail && blockedSets.emails.has(normalizedEmail)) {
+    return `email ${identitySelection.email}`;
+  }
+
+  const normalizedXAuthToken = normalizeXAuthTokenForIdentity(identitySelection?.xAuthToken);
+  if (normalizedXAuthToken && blockedSets.xAuthTokens.has(normalizedXAuthToken)) {
+    return `X auth token for ${identitySelection?.email ?? 'selected identity'}`;
+  }
+
+  return '';
+}
+
+async function assertIdentitySelectionIsStillAvailable(identitySelection) {
+  return withIdentityPoolLock(async () => {
+    const usedIdentities = await readIdentityRecordFile(USED_IDENTITIES_PATH, 'Used identities');
+    const refusedIdentities = await readIdentityRecordFile(REFUSED_IDENTITIES_PATH, 'Refused identities');
+    const reservedIdentities = await readIdentityRecordFile(RESERVED_IDENTITIES_PATH, 'Reserved identities');
+    const reservationId = String(identitySelection?.reservationId ?? '').trim();
+    const normalizedEmail = normalizeEmail(identitySelection?.email);
+    const otherReservedIdentities = reservedIdentities.filter((entry) => {
+      if (reservationId && String(entry?.reservationId ?? '').trim() === reservationId) {
+        return false;
+      }
+
+      return normalizeEmail(entry?.email) !== normalizedEmail;
+    });
+    const blockedSets = buildBlockedIdentitySets([
+      ...usedIdentities,
+      ...refusedIdentities,
+      ...otherReservedIdentities,
+    ]);
+    const conflict = findBlockedIdentityConflict(identitySelection, blockedSets);
+
+    if (conflict) {
+      throw new Error(`Selected identity is no longer available because ${conflict} is already used, refused, or reserved.`);
+    }
+  });
 }
 
 function getSonjjMailboxConfig(email) {
@@ -509,25 +880,6 @@ function getSonjjMailboxConfig(email) {
   }
 
   throw new Error(`Unsupported SonJJ mailbox provider for ${email}. Expected an @outlook.com or @gmail.com address.`);
-}
-
-function pickFirstUnusedValue(values, usedValues, label) {
-  const usedSet = new Set(usedValues.map((value) => String(value ?? '').trim()).filter(Boolean));
-  const match = values.find((value) => !usedSet.has(String(value ?? '').trim()));
-
-  if (!match) {
-    throw new Error(`No unused ${label} values remain in the identity pool.`);
-  }
-
-  return match;
-}
-
-function listUnusedValues(values, reservedValues) {
-  const reservedSet = new Set(
-    reservedValues.map((value) => String(value ?? '').trim()).filter(Boolean),
-  );
-
-  return values.filter((value) => !reservedSet.has(String(value ?? '').trim()));
 }
 
 function createNameAllocator(values, reservedValues, { reverse = false } = {}) {
@@ -629,6 +981,8 @@ async function resolveIdentitySelections({
   requestedDescription,
   limit,
   emailPoolPath = MY_EMAIL_POOL_PATH,
+  xAuthPoolPath = X_AUTH_POOL_PATH,
+  fallbackXAuthEntry = null,
   identityOrder = 'forward',
 }) {
   return withIdentityPoolLock(async () => {
@@ -649,14 +1003,17 @@ async function resolveIdentitySelections({
       keepEmpty: true,
     });
     const emailEntries = await loadEmailEntryPoolFile(emailPoolPath, 'My email pool');
-    const blockedEmailSet = new Set(
-      [...usedIdentities, ...refusedIdentities, ...reservedIdentities]
-        .map((entry) => normalizeEmail(entry?.email))
-        .filter(Boolean),
-    );
+    const loadedXAuthEntries = await loadXAuthPoolFile(xAuthPoolPath, 'X auth pool');
+    const rawXAuthEntries = loadedXAuthEntries.length > 0
+      ? loadedXAuthEntries
+      : fallbackXAuthEntry
+        ? Array.from({ length: requestedLimit }, () => fallbackXAuthEntry)
+        : [];
+    const blockedSets = buildBlockedIdentitySets([...usedIdentities, ...refusedIdentities, ...reservedIdentities]);
     const availableEmailEntries = emailEntries.filter(
-      (entry) => !blockedEmailSet.has(normalizeEmail(entry.email)),
+      (entry) => !blockedSets.emails.has(normalizeEmail(entry.email)),
     );
+    const xAuthEntries = filterAvailableUniqueXAuthEntries(rawXAuthEntries, blockedSets.xAuthTokens);
     const useReverseOrder = identityOrder === 'reverse';
 
     if (availableEmailEntries.length === 0) {
@@ -683,6 +1040,7 @@ async function resolveIdentitySelections({
       : createDescriptionAllocator(descriptions, reservedDescriptions, { reverse: useReverseOrder });
     const maxSelectable = Math.min(
       orderedAvailableEmailEntries.length,
+      xAuthEntries.length,
       explicitNickname ? Number.POSITIVE_INFINITY : nicknameAllocator.availableCount,
       explicitDescription ? Number.POSITIVE_INFINITY : descriptionAllocator.availableCount,
     );
@@ -707,7 +1065,8 @@ async function resolveIdentitySelections({
       );
     }
 
-    const selectedIdentities = selectedEmailEntries.slice(0, selectedCount).map((selectedEmailEntry) => {
+    const orderedXAuthEntries = useReverseOrder ? [...xAuthEntries].reverse() : xAuthEntries;
+    const selectedIdentities = selectedEmailEntries.slice(0, selectedCount).map((selectedEmailEntry, selectionIndex) => {
       const resolvedEmail = selectedEmailEntry.email;
       const existingIdentity = usedIdentities.find(
         (entry) => normalizeEmail(entry?.email) === normalizeEmail(resolvedEmail),
@@ -731,6 +1090,7 @@ async function resolveIdentitySelections({
         reservedDescriptions.push(resolvedDescription);
       }
 
+      const xAuthEntry = orderedXAuthEntries[selectionIndex];
       return {
         reservationId: crypto.randomUUID(),
         reservedAt: new Date().toISOString(),
@@ -738,6 +1098,7 @@ async function resolveIdentitySelections({
         timestamp: selectedEmailEntry.timestamp,
         nickname: resolvedNickname,
         description: resolvedDescription,
+        xAuthToken: xAuthEntry.xAuthToken,
       };
     });
 
@@ -1245,16 +1606,47 @@ async function updateProfile({ accessToken, nickname, description }) {
   }
 }
 
+async function getCurrentProjectIgnites(accessToken, resolvedProjectId) {
+  const leaderboardMe = await fetchAuthedJson(accessToken, '/leaderboard/me');
+  const topProjects = Array.isArray(leaderboardMe?.topProjects) ? leaderboardMe.topProjects : [];
+  const project = topProjects.find((entry) => String(entry?.projectId ?? '') === String(resolvedProjectId));
+  return Math.max(0, Number(project?.ignites ?? 0));
+}
+
 async function allocateProjectIgnites({ accessToken, resolvedProjectId, allocationAmount }) {
+  const currentProjectIgnites = await getCurrentProjectIgnites(accessToken, resolvedProjectId).catch(() => 0);
+  const personalCapacityBefore = await fetchAuthedJson(accessToken, '/ignites/capacity');
+  const availableCapacity = Math.max(0, Number(personalCapacityBefore?.available ?? 0));
+  const requestedAmount = allocationAmount === 'max'
+    ? Math.max(0, Math.min(DEFAULT_MAX_PROJECT_IGNITES - currentProjectIgnites, availableCapacity))
+    : Number(allocationAmount);
+
+  if (!Number.isInteger(requestedAmount) || requestedAmount < 0) {
+    throw new Error(`Allocation amount must be a positive integer or "max". Received: ${allocationAmount}`);
+  }
+
+  if (requestedAmount === 0) {
+    return {
+      allocationStatus: currentProjectIgnites > 0 ? 'already-allocated' : 'no-capacity',
+      allocatedAmount: currentProjectIgnites,
+      newlyAllocatedAmount: 0,
+      requestedAmount,
+      currentProjectIgnites,
+      finalProjectIgnites: currentProjectIgnites,
+      personalCapacity: personalCapacityBefore,
+    };
+  }
+
   let hasFreshAllocation = false;
   let allocationStatus = null;
+  let allocationResult = null;
 
   try {
-    await fetchAuthedJson(accessToken, '/ignites/allocate', {
+    allocationResult = await fetchAuthedJson(accessToken, '/ignites/allocate', {
       method: 'POST',
       body: {
         projectId: resolvedProjectId,
-        amount: allocationAmount,
+        amount: requestedAmount,
       },
     });
     hasFreshAllocation = true;
@@ -1268,15 +1660,12 @@ async function allocateProjectIgnites({ accessToken, resolvedProjectId, allocati
     allocationStatus = 'insufficient-capacity';
   }
 
-  const projectCapacity = await fetchAuthedJson(
-    accessToken,
-    `/ignites/capacity?projectId=${encodeURIComponent(resolvedProjectId)}`,
-  );
+  const personalCapacity = await fetchAuthedJson(accessToken, '/ignites/capacity');
 
   if (!hasFreshAllocation && allocationStatus === 'insufficient-capacity') {
-    const existingAllocations = findProjectAllocations(projectCapacity, resolvedProjectId);
+    const existingAllocations = findProjectAllocations(personalCapacity, resolvedProjectId);
     const matchedAllocation = existingAllocations.find(
-      (entry) => Number(entry?.amount ?? 0) >= allocationAmount,
+      (entry) => Number(entry?.amount ?? 0) >= requestedAmount,
     );
 
     if (matchedAllocation) {
@@ -1284,22 +1673,41 @@ async function allocateProjectIgnites({ accessToken, resolvedProjectId, allocati
     }
   }
 
-  return allocationStatus;
+  const finalProjectIgnites = await getCurrentProjectIgnites(accessToken, resolvedProjectId).catch(() => currentProjectIgnites);
+  if (finalProjectIgnites > currentProjectIgnites && allocationStatus !== 'allocated') {
+    allocationStatus = 'allocated';
+  }
+
+  return {
+    allocationStatus,
+    allocatedAmount: finalProjectIgnites,
+    newlyAllocatedAmount: Math.max(0, finalProjectIgnites - currentProjectIgnites),
+    requestedAmount,
+    currentProjectIgnites,
+    finalProjectIgnites,
+    allocationResult,
+    personalCapacity,
+  };
 }
 
-function logAllocationOutcome({ logPrefix, resolvedEmail, allocationStatus }) {
+function logAllocationOutcome({ logPrefix, resolvedEmail, allocationStatus, allocatedAmount }) {
   if (allocationStatus === 'already-allocated') {
     console.log(`${logPrefix}Login completed and the requested ignites were already allocated for ${resolvedEmail}.`);
     return;
   }
 
   if (allocationStatus === 'allocated') {
-    console.log(`${logPrefix}Login completed and ignites allocated for ${resolvedEmail}.`);
+    console.log(`${logPrefix}Login completed and ${allocatedAmount ?? 'requested'} ignites allocated for ${resolvedEmail}.`);
     return;
   }
 
   if (allocationStatus === 'insufficient-capacity') {
     console.log(`${logPrefix}Login completed but ignites could not be allocated for ${resolvedEmail} due to insufficient capacity.`);
+    return;
+  }
+
+  if (allocationStatus === 'no-capacity') {
+    console.log(`${logPrefix}Login completed for ${resolvedEmail}, but there is no available ignite capacity to allocate.`);
     return;
   }
 
@@ -1317,11 +1725,13 @@ async function runSingleLoginSession({
   identitySelection,
   batchIndex,
   batchTotal,
+  xAuthToken,
 }) {
   const resolvedEmail = String(identitySelection.email ?? '').trim();
   const reservationId = String(identitySelection.reservationId ?? '').trim();
   const resolvedNickname = String(identitySelection.nickname ?? '').trim();
   const resolvedDescription = String(identitySelection.description ?? '').trim();
+  const sessionXAuthToken = identitySelection.xAuthToken || xAuthToken;
   const mailboxTimestamp = String(identitySelection.timestamp ?? '').trim();
   const logPrefix = batchTotal > 1 ? `[${batchIndex + 1}/${batchTotal}] ` : '';
   const mailboxConfig = getSonjjMailboxConfig(resolvedEmail);
@@ -1333,6 +1743,8 @@ async function runSingleLoginSession({
   if (!isNumericString(mailboxTimestamp)) {
     throw new Error(`Mailbox timestamp is required from ${MY_EMAIL_POOL_PATH} for ${resolvedEmail}.`);
   }
+
+  await assertIdentitySelectionIsStillAvailable(identitySelection);
 
   console.log(`${logPrefix}Sending OTP to ${resolvedEmail} using SonJJ ${mailboxConfig.provider} mailbox ...`);
 
@@ -1400,7 +1812,7 @@ async function runSingleLoginSession({
     throw new Error('Privy authenticate succeeded but no usable auth tokens were returned.');
   }
 
-  const { backendLogin, backendLoginTokens } = await exchangeBackendLogin({
+  const { backendLogin, backendLoginTokens, backendLoginTokenSource } = await exchangeBackendLogin({
     cookieJar,
     tokenCandidates,
     inviteCode,
@@ -1417,7 +1829,20 @@ async function runSingleLoginSession({
     description: resolvedDescription,
   });
 
-  const { allocationStatus } = await allocateProjectIgnites({
+  const xLinked = await connectXAccountWithPrivyOAuthLink({
+    cookieJar,
+    clientAnalyticsId,
+    accessToken: backendLoginTokens.accessToken,
+    privyAccessToken: privyAuthData.token,
+    xAuthToken: sessionXAuthToken,
+    logPrefix,
+  });
+
+  if (sessionXAuthToken && !xLinked) {
+    throw new Error(`X auth link did not appear in Surge /auth/me socials for ${resolvedEmail}.`);
+  }
+ 
+  const { allocationStatus, allocatedAmount, newlyAllocatedAmount, finalProjectIgnites } = await allocateProjectIgnites({
     accessToken: backendLoginTokens.accessToken,
     resolvedProjectId,
     allocationAmount,
@@ -1428,7 +1853,11 @@ async function runSingleLoginSession({
     email: resolvedEmail,
     nickname: resolvedNickname,
     description: resolvedDescription,
+    xAuthToken: sessionXAuthToken,
     allocationStatus,
+    allocatedAmount,
+    newlyAllocatedAmount,
+    finalProjectIgnites,
     usedAt: new Date().toISOString(),
   });
 
@@ -1436,6 +1865,7 @@ async function runSingleLoginSession({
     logPrefix,
     resolvedEmail,
     allocationStatus,
+    allocatedAmount: newlyAllocatedAmount || allocatedAmount,
   });
 
   if (batchIndex < batchTotal - 1) {
@@ -1447,7 +1877,31 @@ async function runSingleLoginSession({
   return {
     email: resolvedEmail,
     allocationStatus,
+    allocatedAmount,
+    newlyAllocatedAmount,
+    finalProjectIgnites,
   };
+}
+
+function classifyFailureReason(message) {
+  const text = String(message ?? '').toLowerCase();
+  if (text.includes('cannot_link_more_of_type') || text.includes('already has an account of that type linked')) {
+    return 'x-already-linked';
+  }
+
+  if (text.includes('privy x oauth') || text.includes('x oauth') || text.includes('x auth') || text.includes('twitter')) {
+    return 'x-link-failed';
+  }
+
+  if (text.includes('otp') || text.includes('sonjj') || text.includes('passwordless')) {
+    return 'otp-failed';
+  }
+
+  if (text.includes('privy') || text.includes('/auth/login') || text.includes('backend token exchange')) {
+    return 'login-failed';
+  }
+
+  return 'run-failed';
 }
 
 function createBatchSuccessResult(batchIndex, email, allocationStatus) {
@@ -1482,16 +1936,22 @@ function loadRuntimeConfig(args, envFile) {
     readSetting(args, envFile, 'email-pool-file', 'SURGE_EMAIL_POOL_FILE', MY_EMAIL_POOL_PATH) ??
       MY_EMAIL_POOL_PATH,
   ).trim();
+  const rawXAuthPoolPath = String(
+    readSetting(args, envFile, 'you-auth-pool-file', 'SURGE_X_AUTH_POOL_FILE', X_AUTH_POOL_PATH) ?? X_AUTH_POOL_PATH,
+  ).trim();
   const identityOrder = String(
     readSetting(args, envFile, 'identity-order', 'SURGE_IDENTITY_ORDER', 'forward') ?? 'forward',
   ).trim().toLowerCase();
-  const allocationAmount = readIntegerSetting(args, envFile, {
-    argKey: 'amount',
-    envKey: 'SURGE_PROJECT_IGNITES',
-    fallbackValue: DEFAULT_PROJECT_IGNITES,
-    label: 'Allocation amount',
-    min: 1,
-  });
+  const rawAllocationAmount = String(readSetting(args, envFile, 'amount', 'SURGE_PROJECT_IGNITES', DEFAULT_PROJECT_IGNITES) ?? '').trim().toLowerCase();
+  const allocationAmount = rawAllocationAmount === 'max'
+    ? 'max'
+    : readIntegerSetting(args, envFile, {
+        argKey: 'amount',
+        envKey: 'SURGE_PROJECT_IGNITES',
+        fallbackValue: DEFAULT_PROJECT_IGNITES,
+        label: 'Allocation amount',
+        min: 1,
+      });
   const captchaToken = readSetting(args, envFile, 'captcha-token', 'SURGE_CAPTCHA_TOKEN', undefined);
   const otpWaitMs = readIntegerSetting(args, envFile, {
     argKey: 'otp-wait-ms',
@@ -1528,7 +1988,9 @@ function loadRuntimeConfig(args, envFile) {
     label: 'Batch delay max',
     min: 0,
   });
-
+  const rawX = readSetting(args, envFile, 'x-token', 'X_AUTH_TOKEN', readSetting(args, envFile, 'x-auth', 'x-auth', ''));
+  const xAuthToken = normalizeBearerToken(rawX);
+ 
   if (!resolvedProjectId) {
     throw new Error('Project id is required. Pass --project-id or set SURGE_PROJECT_ID.');
   }
@@ -1553,6 +2015,9 @@ function loadRuntimeConfig(args, envFile) {
     emailPoolPath: path.isAbsolute(rawEmailPoolPath)
       ? rawEmailPoolPath
       : path.resolve(projectRoot, rawEmailPoolPath),
+    xAuthPoolPath: path.isAbsolute(rawXAuthPoolPath)
+      ? rawXAuthPoolPath
+      : path.resolve(projectRoot, rawXAuthPoolPath),
     identityOrder,
     allocationAmount,
     captchaToken,
@@ -1561,6 +2026,8 @@ function loadRuntimeConfig(args, envFile) {
     requestedLimit,
     batchDelayMinMs,
     batchDelayMaxMs,
+    xAuthToken,
+    fallbackXAuthEntry: xAuthToken ? { xAuthToken } : null,
   };
 }
 
@@ -1580,6 +2047,7 @@ async function main() {
     requestedDescription,
     resolvedProjectId,
     emailPoolPath,
+    xAuthPoolPath,
     identityOrder,
     allocationAmount,
     captchaToken,
@@ -1588,6 +2056,8 @@ async function main() {
     requestedLimit,
     batchDelayMinMs,
     batchDelayMaxMs,
+    xAuthToken,
+    fallbackXAuthEntry,
   } = runtimeConfig;
 
   const identitySelections = await resolveIdentitySelections({
@@ -1595,6 +2065,8 @@ async function main() {
     requestedDescription,
     limit: requestedLimit,
     emailPoolPath,
+    xAuthPoolPath,
+    fallbackXAuthEntry,
     identityOrder,
   });
   const batchResults = [];
@@ -1614,6 +2086,7 @@ async function main() {
         identitySelection,
         batchIndex,
         batchTotal,
+        xAuthToken,
       });
 
       batchResults.push(
@@ -1622,7 +2095,16 @@ async function main() {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
 
-      await releaseReservedIdentity(identitySelection);
+      const failureReason = classifyFailureReason(message);
+      const shouldConsumeXToken = failureReason === 'x-already-linked' || failureReason === 'x-link-failed';
+      const { xAuthToken: _failedXAuthToken, ...identityWithoutX } = identitySelection;
+      await recordRefusedIdentity({
+        ...identityWithoutX,
+        ...(shouldConsumeXToken ? { xAuthToken: _failedXAuthToken } : {}),
+        reason: failureReason,
+        refusedAt: new Date().toISOString(),
+        error: message,
+      });
       batchResults.push(createBatchFailureResult(batchIndex, identitySelection.email, message));
 
       if (message !== 'otp-refused') {
